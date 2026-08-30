@@ -10,7 +10,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,11 +25,10 @@ import (
 
 var (
 	sharedAMQPURL string
-	portCounter   int32 = 19000
 )
 
 func getNextPort() int {
-	return int(atomic.AddInt32(&portCounter, 1))
+	return 0 // OS assigned port
 }
 
 func TestMain(m *testing.M) {
@@ -128,7 +126,7 @@ func TestChitchatRabbitMQMocking(t *testing.T) {
 	if err := eng.Start(); err != nil {
 		t.Fatalf("failed to start engine: %v", err)
 	}
-	defer eng.Stop()
+	defer eng.Stop(context.Background())
 
 	// Publish triggering message
 	payload := map[string]interface{}{
@@ -173,7 +171,7 @@ func TestChitchatRabbitMQMocking(t *testing.T) {
 	}
 
 	// Verify spy REST endpoint
-	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/_chitchat/messages?queue=%s", spyPort, triggerQueue))
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/_chitchat/messages?queue=%s", spyServer.Port(), triggerQueue))
 	if err != nil {
 		t.Fatalf("failed to query spy endpoint: %v", err)
 	}
@@ -262,7 +260,7 @@ func TestChitchatTopologyDeclaration(t *testing.T) {
 	if err := eng.Start(); err != nil {
 		t.Fatalf("failed to start engine with topology declarations: %v", err)
 	}
-	defer eng.Stop()
+	defer eng.Stop(context.Background())
 
 	// Publish to topic exchange with routing key matching pattern
 	err := ch.Publish(exchangeName, publishRoutingKey, false, false, amqp091.Publishing{
@@ -360,7 +358,7 @@ func TestChitchatMultipleRulesAndFiltering(t *testing.T) {
 	_ = driver.Connect(sharedAMQPURL)
 	eng := engine.NewEngine(cfg, driver, ringBuffer)
 	_ = eng.Start()
-	defer eng.Stop()
+	defer eng.Stop(context.Background())
 
 	shippedMsgs, _ := ch.Consume(shippedQueue, "", true, false, false, false, nil)
 	cancelledMsgs, _ := ch.Consume(cancelledQueue, "", true, false, false, false, nil)
@@ -409,7 +407,7 @@ func TestChitchatMultipleRulesAndFiltering(t *testing.T) {
 
 	// Assert spy buffer captured all 3 messages
 	time.Sleep(100 * time.Millisecond)
-	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/_chitchat/messages", spyPort))
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/_chitchat/messages", spyServer.Port()))
 	if err != nil {
 		t.Fatalf("failed to query spy: %v", err)
 	}
@@ -422,7 +420,7 @@ func TestChitchatMultipleRulesAndFiltering(t *testing.T) {
 	}
 
 	// Assert REST /_chitchat/health endpoint
-	healthResp, err := http.Get(fmt.Sprintf("http://localhost:%d/_chitchat/health", spyPort))
+	healthResp, err := http.Get(fmt.Sprintf("http://localhost:%d/_chitchat/health", spyServer.Port()))
 	if err != nil {
 		t.Fatalf("failed to query health: %v", err)
 	}
@@ -434,14 +432,14 @@ func TestChitchatMultipleRulesAndFiltering(t *testing.T) {
 	}
 
 	// Test POST /_chitchat/clear
-	clearResp, err := http.Post(fmt.Sprintf("http://localhost:%d/_chitchat/clear", spyPort), "application/json", nil)
+	clearResp, err := http.Post(fmt.Sprintf("http://localhost:%d/_chitchat/clear", spyServer.Port()), "application/json", nil)
 	if err != nil {
 		t.Fatalf("failed to clear spy: %v", err)
 	}
 	clearResp.Body.Close()
 
 	// Verify buffer is empty after clear
-	emptyResp, _ := http.Get(fmt.Sprintf("http://localhost:%d/_chitchat/messages", spyPort))
+	emptyResp, _ := http.Get(fmt.Sprintf("http://localhost:%d/_chitchat/messages", spyServer.Port()))
 	var clearedList []spy.CapturedMessage
 	_ = json.NewDecoder(emptyResp.Body).Decode(&clearedList)
 	emptyResp.Body.Close()
@@ -503,7 +501,7 @@ func TestChitchatDynamicTemplateFunctions(t *testing.T) {
 	_ = driver.Connect(sharedAMQPURL)
 	eng := engine.NewEngine(cfg, driver, ringBuffer)
 	_ = eng.Start()
-	defer eng.Stop()
+	defer eng.Stop(context.Background())
 
 	responseChan, _ := ch.Consume(resultQueue, "", true, false, false, false, nil)
 
@@ -622,7 +620,7 @@ func TestChitchatDelayedResponse(t *testing.T) {
 	_ = driver.Connect(sharedAMQPURL)
 	eng := engine.NewEngine(cfg, driver, ringBuffer)
 	_ = eng.Start()
-	defer eng.Stop()
+	defer eng.Stop(context.Background())
 
 	responseChan, _ := ch.Consume(resultQueue, "", true, false, false, false, nil)
 
@@ -736,7 +734,7 @@ func TestChitchatFanoutExchangeRouting(t *testing.T) {
 	_ = driver.Connect(sharedAMQPURL)
 	eng := engine.NewEngine(cfg, driver, ringBuffer)
 	_ = eng.Start()
-	defer eng.Stop()
+	defer eng.Stop(context.Background())
 
 	smsChan, _ := ch.Consume(smsResultQueue, "", true, false, false, false, nil)
 	emailChan, _ := ch.Consume(emailResultQueue, "", true, false, false, false, nil)

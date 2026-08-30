@@ -140,7 +140,7 @@ func (e *Engine) handleMessage(msg broker.Message) {
 }
 
 // Stop gracefully shuts down the engine and its background workers.
-func (e *Engine) Stop() error {
+func (e *Engine) Stop(ctx context.Context) error {
 	e.mu.Lock()
 	if !e.running {
 		e.mu.Unlock()
@@ -150,6 +150,7 @@ func (e *Engine) Stop() error {
 	e.mu.Unlock()
 
 	e.cancel()
+	e.driver.Close()
 	close(e.msgChan)
 	e.wg.Wait()
 

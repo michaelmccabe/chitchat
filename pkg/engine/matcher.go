@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"reflect"
 	"regexp"
 	"strings"
@@ -94,7 +94,7 @@ func TemplateFuncs() template.FuncMap {
 			if min >= max {
 				return min
 			}
-			return rand.Intn(max-min+1) + min
+			return rand.N(max-min+1) + min
 		},
 		"now": func() string {
 			return time.Now().UTC().Format(time.RFC3339)

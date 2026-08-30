@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"sync"
@@ -207,7 +208,7 @@ func TestEngine_EndToEnd(t *testing.T) {
 		t.Errorf("expected 1 spy recorded message, got %d", recCount)
 	}
 
-	if err := eng.Stop(); err != nil {
+	if err := eng.Stop(context.Background()); err != nil {
 		t.Fatalf("failed to stop engine: %v", err)
 	}
 }

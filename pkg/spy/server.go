@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -137,10 +138,17 @@ func NewServer(port int, buffer *RingBuffer) *Server {
 
 // Start launches the HTTP spy server in the background.
 func (s *Server) Start() error {
+	addr := fmt.Sprintf(":%d", s.port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to bind spy server to %s: %w", addr, err)
+	}
+	
+	s.port = ln.Addr().(*net.TCPAddr).Port
 	s.logger.Info("starting spy rest server", "port", s.port)
 
 	go func() {
-		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			s.logger.Error("spy server listener error", "error", err)
 		}
 	}()
@@ -157,6 +165,10 @@ func (s *Server) Stop(ctx context.Context) error {
 // Buffer returns the underlying ring buffer.
 func (s *Server) Buffer() *RingBuffer {
 	return s.buffer
+}
+
+func (s *Server) Port() int {
+	return s.port
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
