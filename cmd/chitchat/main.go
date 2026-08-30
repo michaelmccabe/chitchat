@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -16,9 +17,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const DefaultVersion = "0.1.0-dev"
 var (
-	// Version is injected via ldflags during build/install
-	Version = "0.1.0-development"
+	// Version is injected via ldflags during build/install or derived from runtime build info
+	Version   = DefaultVersion
+	GitCommit = ""
+	BuildTime = ""
 
 	configPath string
 	portFlag   int
@@ -26,6 +30,29 @@ var (
 	logLevel   string
 	logFormat  string
 )
+
+func init() {
+	// If Version is not overridden via -ldflags, attempt to read from Go runtime build info
+	if Version == "" || Version == DefaultVersion {
+		if bi, ok := debug.ReadBuildInfo(); ok {
+			if bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+				Version = bi.Main.Version
+			}
+			for _, s := range bi.Settings {
+				if s.Key == "vcs.revision" && GitCommit == "" {
+					if len(s.Value) > 7 {
+						GitCommit = s.Value[:7]
+					} else {
+						GitCommit = s.Value
+					}
+				}
+				if s.Key == "vcs.time" && BuildTime == "" {
+					BuildTime = s.Value
+				}
+			}
+		}
+	}
+}
 
 func main() {
 	rootCmd := &cobra.Command{
@@ -56,13 +83,23 @@ exchanges/queues, listens for triggers, and exposes the HTTP spy server.`,
 		Use:   "version",
 		Short: "Print the version of chitchat",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("chitchat version %s\n", Version)
+			if GitCommit != "" && BuildTime != "" {
+				fmt.Printf("chitchat version %s (commit: %s, built: %s)\n", Version, GitCommit, BuildTime)
+			} else if GitCommit != "" {
+				fmt.Printf("chitchat version %s (commit: %s)\n", Version, GitCommit)
+			} else {
+				fmt.Printf("chitchat version %s\n", Version)
+			}
 		},
 	}
 
 	// Register flags
-	addFlags(rootCmd)
-	addFlags(startCmd)
+	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "chitchat-rules.yaml", "Path to rules configuration YAML file")
+	rootCmd.PersistentFlags().IntVarP(&portFlag, "port", "p", 0, "Port for the HTTP Spy server (overrides config)")
+	rootCmd.PersistentFlags().StringVarP(&amqpURL, "amqp-url", "u", "", "AMQP broker connection URL (overrides config)")
+	rootCmd.PersistentFlags().StringVarP(&logLevel, "log-level", "l", "", "Logging level (debug, info, warn, error)")
+	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "", "Logging output format (text, json)")
+	
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(versionCmd)
 
@@ -71,13 +108,6 @@ exchanges/queues, listens for triggers, and exposes the HTTP spy server.`,
 	}
 }
 
-func addFlags(cmd *cobra.Command) {
-	cmd.Flags().StringVarP(&configPath, "config", "c", "chitchat-rules.yaml", "Path to rules configuration YAML file")
-	cmd.Flags().IntVarP(&portFlag, "port", "p", 0, "Port for the HTTP Spy server (overrides config)")
-	cmd.Flags().StringVarP(&amqpURL, "amqp-url", "u", "", "AMQP broker connection URL (overrides config)")
-	cmd.Flags().StringVarP(&logLevel, "log-level", "l", "", "Logging level (debug, info, warn, error)")
-	cmd.Flags().StringVar(&logFormat, "log-format", "", "Logging output format (text, json)")
-}
 
 func runChitchat() error {
 	// 1. Load configuration
@@ -97,7 +127,7 @@ func runChitchat() error {
 	l.Info("initializing chitchat engine",
 		"version", Version,
 		"config", configPath,
-		"broker_url", cfg.Broker.URL,
+		"broker_url", broker.SanitizeURL(cfg.Broker.URL),
 		"spy_port", cfg.Server.Port,
 		"log_level", cfg.Logging.Level,
 	)
@@ -111,7 +141,7 @@ func runChitchat() error {
 
 	// 5. Initialize RabbitMQ Driver
 	driver := broker.NewRabbitMQDriver()
-	if err := driver.Connect(cfg.Broker.URL); err != nil {
+	if err := driver.Connect(broker.SanitizeURL(cfg.Broker.URL)); err != nil {
 		_ = spyServer.Stop(context.Background())
 		return fmt.Errorf("failed to connect to rabbitmq: %w", err)
 	}
@@ -119,7 +149,7 @@ func runChitchat() error {
 	// 6. Initialize and Start Mocking Engine
 	eng := engine.NewEngine(cfg, driver, ringBuffer)
 	if err := eng.Start(); err != nil {
-		_ = eng.Stop()
+		_ = eng.Stop(context.Background())
 		_ = spyServer.Stop(context.Background())
 		return fmt.Errorf("failed to start engine: %w", err)
 	}
@@ -128,6 +158,13 @@ func runChitchat() error {
 
 	// 7. Handle OS signals for graceful termination
 	sigChan := make(chan os.Signal, 1)
+	forceExit := make(chan os.Signal, 1)
+	signal.Notify(forceExit, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-forceExit
+		<-forceExit
+		os.Exit(1)
+	}()
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	sig := <-sigChan
 
@@ -136,7 +173,7 @@ func runChitchat() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := eng.Stop(); err != nil {
+	if err := eng.Stop(shutdownCtx); err != nil {
 		l.Error("error shutting down engine", "error", err)
 	}
 	if err := spyServer.Stop(shutdownCtx); err != nil {

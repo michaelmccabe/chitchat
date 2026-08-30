@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag name (e.g. v1.0.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Publish Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Run Tests Prior to Release
+        run: |
+          go test -v -race ./pkg/...
+          go test -v -timeout 10m ./integration_tests/...
+
+      - name: Resolve Release Version
+        id: release_version
+        run: |
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+            IS_PRERELEASE="false"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+            IS_PRERELEASE="false"
+          else
+            LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            if [ -n "$LATEST_TAG" ]; then
+              TAG="${LATEST_TAG}"
+            else
+              TAG="v0.1.0-$(git rev-parse --short HEAD)"
+            fi
+            IS_PRERELEASE="false"
+          fi
+
+          GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          BUILD_TIME=$(date -u '+%Y-%m-%d_%H:%M:%S')
+
+          echo "TAG=${TAG}" >> $GITHUB_OUTPUT
+          echo "GIT_COMMIT=${GIT_COMMIT}" >> $GITHUB_OUTPUT
+          echo "BUILD_TIME=${BUILD_TIME}" >> $GITHUB_OUTPUT
+          echo "IS_PRERELEASE=${IS_PRERELEASE}" >> $GITHUB_OUTPUT
+          echo "Releasing version ${TAG} (${GIT_COMMIT})"
+
+      - name: Compile Multi-Platform Binaries
+        env:
+          VERSION: ${{ steps.release_version.outputs.TAG }}
+          GIT_COMMIT: ${{ steps.release_version.outputs.GIT_COMMIT }}
+          BUILD_TIME: ${{ steps.release_version.outputs.BUILD_TIME }}
+        run: |
+          mkdir -p dist
+          LDFLAGS="-s -w -X main.Version=${VERSION} -X main.GitCommit=${GIT_COMMIT} -X main.BuildTime=${BUILD_TIME}"
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-linux-amd64 ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-linux-arm64 ./cmd/chitchat
+
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-darwin-amd64 ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-darwin-arm64 ./cmd/chitchat
+
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-windows-amd64.exe ./cmd/chitchat
+
+          cd dist
+          sha256sum * > checksums.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_version.outputs.TAG }}
+          name: Release ${{ steps.release_version.outputs.TAG }}
+          files: dist/*
+          draft: false
+          prerelease: ${{ steps.release_version.outputs.IS_PRERELEASE == 'true' }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

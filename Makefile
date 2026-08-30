@@ -15,14 +15,14 @@ GOFLAGS?=-mod=mod
 # Build directory
 BUILD_DIR=bin
 
-# Version information
-GIT_VERSION := $(shell git describe --tags --dirty --always 2>/dev/null)
-VERSION ?= $(if $(GIT_VERSION),$(GIT_VERSION),0.1.0-development)
-BUILD_TIME=$(shell date -u '+%Y-%m-%d_%H:%M:%S')
-GIT_COMMIT=$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+# Version information (derived from git tags automatically)
+GIT_VERSION := $(shell git describe --tags --always --dirty 2>/dev/null)
+VERSION ?= $(if $(GIT_VERSION),$(GIT_VERSION),0.1.0-dev)
+BUILD_TIME := $(shell date -u '+%Y-%m-%d_%H:%M:%S')
+GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
 # Ldflags for version injection
-LDFLAGS=-ldflags "-X main.Version=$(VERSION)"
+LDFLAGS := -ldflags "-X main.Version=$(VERSION) -X main.GitCommit=$(GIT_COMMIT) -X main.BuildTime=$(BUILD_TIME)"
 
 .PHONY: all build install clean test test-coverage test-integration tidy deps run build-all help
 
@@ -53,19 +53,19 @@ clean:
 # Run unit tests
 test:
 	@echo "Running unit tests..."
-	$(GOTEST) $(GOFLAGS) -v ./pkg/...
+	$(GOTEST) $(GOFLAGS) -v -race ./pkg/...
 
 # Run tests with coverage
 test-coverage:
 	@echo "Running tests with coverage..."
-	$(GOTEST) $(GOFLAGS) -v -coverprofile=coverage.out ./pkg/...
+	$(GOTEST) $(GOFLAGS) -v -race -coverprofile=coverage.out ./pkg/...
 	$(GOCMD) tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated: coverage.html"
 
 # Run integration tests (requires Docker)
 test-integration:
 	@echo "Running integration tests..."
-	$(GOTEST) $(GOFLAGS) -v -timeout 5m ./integration_tests/...
+	$(GOTEST) $(GOFLAGS) -v -timeout 10m ./integration_tests/...
 
 # Tidy dependencies
 tidy:
@@ -88,6 +88,7 @@ build-all: clean
 	@echo "Building for multiple platforms..."
 	@mkdir -p $(BUILD_DIR)
 	GOOS=linux GOARCH=amd64 $(GOBUILD) $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/chitchat
+	GOOS=linux GOARCH=arm64 $(GOBUILD) $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-arm64 ./cmd/chitchat
 	GOOS=darwin GOARCH=amd64 $(GOBUILD) $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 ./cmd/chitchat
 	GOOS=darwin GOARCH=arm64 $(GOBUILD) $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 ./cmd/chitchat
 	GOOS=windows GOARCH=amd64 $(GOBUILD) $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-windows-amd64.exe ./cmd/chitchat

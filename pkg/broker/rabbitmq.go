@@ -42,7 +42,7 @@ func (r *RabbitMQDriver) Connect(amqpURL string) error {
 		return nil
 	}
 
-	sanitizedURL := sanitizeURL(amqpURL)
+	sanitizedURL := SanitizeURL(amqpURL)
 	r.logger.Info("connecting to rabbitmq", "url", sanitizedURL)
 
 	conn, err := amqp.Dial(amqpURL)
@@ -148,6 +148,9 @@ func (r *RabbitMQDriver) DeclareTopology(declarations *config.Declarations) erro
 }
 
 // StartConsuming attaches a consumer loop to the given queue and pipes deliveries to messageChan.
+// StartConsuming attaches a consumer loop to the given queue.
+// Note: The consumer goroutine reads r.ctx and writes to messageChan without holding the lock.
+// This is safe because r.ctx is immutable after construction.
 func (r *RabbitMQDriver) StartConsuming(queue string, messageChan chan<- Message) error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -290,11 +293,14 @@ func (r *RabbitMQDriver) Close() error {
 	return firstErr
 }
 
-// sanitizeURL masks credentials in broker connection strings for safe logging.
-func sanitizeURL(rawURL string) string {
+// SanitizeURL masks credentials in broker connection strings for safe logging.
+func SanitizeURL(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return "[invalid url]"
 	}
-	return u.Redacted()
+	if u.User != nil {
+		u.User = url.UserPassword(u.User.Username(), "xxxxx")
+	}
+	return u.String()
 }

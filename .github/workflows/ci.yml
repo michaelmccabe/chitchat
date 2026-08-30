@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+      - 'feat/**'
+      - 'fix/**'
+      - 'release/**'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Verify Dependencies
+        run: |
+          go mod verify
+          go mod download
+
+      - name: Run Unit Tests
+        run: |
+          go test -v -race -coverprofile=coverage.out ./pkg/...
+
+      - name: Run Integration Tests (Testcontainers)
+        run: |
+          go test -v -timeout 10m ./integration_tests/...
+
+  build:
+    name: Build & Save Binaries
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Determine Version
+        id: version_step
+        run: |
+          GIT_TAG=$(git describe --tags --always --dirty 2>/dev/null || echo "0.1.0-dev")
+          GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          BUILD_TIME=$(date -u '+%Y-%m-%d_%H:%M:%S')
+          echo "VERSION=${GIT_TAG}" >> $GITHUB_OUTPUT
+          echo "GIT_COMMIT=${GIT_COMMIT}" >> $GITHUB_OUTPUT
+          echo "BUILD_TIME=${BUILD_TIME}" >> $GITHUB_OUTPUT
+          echo "Resolved version: ${GIT_TAG} (${GIT_COMMIT})"
+
+      - name: Compile Multi-Platform Binaries
+        env:
+          VERSION: ${{ steps.version_step.outputs.VERSION }}
+          GIT_COMMIT: ${{ steps.version_step.outputs.GIT_COMMIT }}
+          BUILD_TIME: ${{ steps.version_step.outputs.BUILD_TIME }}
+        run: |
+          mkdir -p dist
+          LDFLAGS="-s -w -X main.Version=${VERSION} -X main.GitCommit=${GIT_COMMIT} -X main.BuildTime=${BUILD_TIME}"
+
+          # Linux AMD64 & ARM64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-linux-amd64 ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-linux-arm64 ./cmd/chitchat
+
+          # macOS (Darwin) AMD64 & ARM64 (Apple Silicon)
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-darwin-amd64 ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-darwin-arm64 ./cmd/chitchat
+
+          # Windows AMD64
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-windows-amd64.exe ./cmd/chitchat
+
+          # Generate checksums
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Save Binaries as Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: chitchat-binaries-${{ steps.version_step.outputs.VERSION }}
+          path: dist/*
+          retention-days: 30

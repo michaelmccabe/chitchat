@@ -26,9 +26,9 @@ func TestSanitizeURL(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		got := sanitizeURL(tc.input)
+		got := SanitizeURL(tc.input)
 		if got != tc.expected {
-			t.Errorf("sanitizeURL(%q) = %q; expected %q", tc.input, got, tc.expected)
+			t.Errorf("SanitizeURL(%q) = %q; expected %q", tc.input, got, tc.expected)
 		}
 	}
 }

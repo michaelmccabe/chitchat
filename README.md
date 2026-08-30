@@ -28,6 +28,11 @@
 
 ```text
 chitchat/
+├── .github/
+│   ├── dependabot.yml          # Dependabot configuration for Go modules & Actions
+│   └── workflows/
+│       ├── ci.yml              # CI pipeline: Unit/Integration tests & binary builds
+│       └── release.yml         # GitHub Release pipeline: Multi-platform binaries
 ├── cmd/
 │   └── chitchat/
 │       └── main.go             # CLI entrypoint & Cobra flags
@@ -52,10 +57,50 @@ chitchat/
 │       └── logger_test.go      # Logger unit tests
 ├── chitchat-rules.yaml         # Default configuration example
 ├── integration_tests/
-│   └── rabbitmq_test.go        # Testcontainers-go integration suite
+│   └── rabbitmq_test.go        # Testcontainers-go integration test suite
 ├── Makefile                    # Build & test shortcuts
 ├── go.mod
 └── go.sum
+```
+
+---
+
+## 🏷️ Versioning & Releases
+
+`chitchat` uses **semantic versioning** based automatically on **Git tags**.
+
+### How Versioning Works
+- When building with `make build`, `make install`, or in GitHub Actions, the binary version is derived from `git describe --tags --always --dirty` and injected into `main.Version`, `main.GitCommit`, and `main.BuildTime` via `-ldflags`.
+- If built directly with `go install` from a remote tag, Go module build info (`debug.ReadBuildInfo()`) is automatically used as a fallback.
+
+### How to Create a New Release Tag
+To tag and release a new version:
+
+```bash
+# 1. Create an annotated Git tag
+git tag -a v1.0.0 -m "Release v1.0.0"
+
+# 2. Push the tag to GitHub
+git push origin v1.0.0
+```
+
+Once pushed, GitHub Actions will:
+1. Trigger the **Release Workflow** (`.github/workflows/release.yml`).
+2. Run unit tests and integration tests.
+3. Cross-compile binaries for:
+   - Linux (`amd64`, `arm64`)
+   - macOS / Darwin (`amd64`, `arm64` Apple Silicon)
+   - Windows (`amd64`)
+4. Compute SHA256 checksums (`checksums.txt`).
+5. Publish a new **GitHub Release** with the binaries attached.
+
+### Checking the Binary Version
+```bash
+chitchat version
+# Output: chitchat version v1.0.0 (commit: 5ce7b4d, built: 2026-08-30_13:22:27)
+
+chitchat --version
+# Output: chitchat version v1.0.0
 ```
 
 ---
@@ -81,7 +126,13 @@ make build
 ./bin/chitchat start --config chitchat-rules.yaml --port 8082
 ```
 
-### 3. CLI Flags
+#### Option C: Multi-platform build
+```bash
+make build-all
+# Binaries are generated under ./bin/ for linux, darwin, and windows
+```
+
+### 2. CLI Flags
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--config` | `-c` | `chitchat-rules.yaml` | Path to rules configuration YAML file |
@@ -137,9 +188,29 @@ rules:
 ### Unit Tests
 ```bash
 make test
+# Or with coverage:
+make test-coverage
 ```
 
 ### Integration Tests (Live RabbitMQ via Testcontainers)
+Integration tests run against a real, containerized RabbitMQ broker via `testcontainers-go`:
 ```bash
 make test-integration
 ```
+
+The integration test suite validates:
+- End-to-end trigger matching and mock response publishing
+- Declarative exchange, queue, and binding topology creation
+- Topic and Fanout broadcast message routing
+- Multi-rule routing and negative condition filtering
+- Dynamic payload templating functions (`{{uuid}}`, `{{system.utc_now}}`, `{{random_int}}`, `{{trigger.*}}`)
+- Delayed mock responses (`delay_ms`)
+- REST Spy endpoints (`GET /_chitchat/messages`, `GET /_chitchat/health`, `POST /_chitchat/clear`)
+
+---
+
+## 🤖 Continuous Integration & Automation
+
+- **CI Pipeline (`.github/workflows/ci.yml`)**: Runs on pull requests and branch pushes, executing unit tests, integration tests, and multi-platform compilation with binary artifact archiving.
+- **Release Pipeline (`.github/workflows/release.yml`)**: Publishes multi-platform binaries and checksums directly to GitHub Releases upon tag creation or successful main builds.
+- **Dependabot (`.github/dependabot.yml`)**: Automatically monitors and updates Go dependencies and GitHub Actions workflows.
