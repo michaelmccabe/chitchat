@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -17,8 +18,10 @@ import (
 )
 
 var (
-	// Version is injected via ldflags during build/install
-	Version = "0.1.0-development"
+	// Version is injected via ldflags during build/install or derived from runtime build info
+	Version   = "0.1.0-dev"
+	GitCommit = ""
+	BuildTime = ""
 
 	configPath string
 	portFlag   int
@@ -26,6 +29,29 @@ var (
 	logLevel   string
 	logFormat  string
 )
+
+func init() {
+	// If Version is not overridden via -ldflags, attempt to read from Go runtime build info
+	if Version == "" || Version == "0.1.0-dev" || Version == "dev" {
+		if bi, ok := debug.ReadBuildInfo(); ok {
+			if bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+				Version = bi.Main.Version
+			}
+			for _, s := range bi.Settings {
+				if s.Key == "vcs.revision" && GitCommit == "" {
+					if len(s.Value) > 7 {
+						GitCommit = s.Value[:7]
+					} else {
+						GitCommit = s.Value
+					}
+				}
+				if s.Key == "vcs.time" && BuildTime == "" {
+					BuildTime = s.Value
+				}
+			}
+		}
+	}
+}
 
 func main() {
 	rootCmd := &cobra.Command{
@@ -56,7 +82,13 @@ exchanges/queues, listens for triggers, and exposes the HTTP spy server.`,
 		Use:   "version",
 		Short: "Print the version of chitchat",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("chitchat version %s\n", Version)
+			if GitCommit != "" && BuildTime != "" {
+				fmt.Printf("chitchat version %s (commit: %s, built: %s)\n", Version, GitCommit, BuildTime)
+			} else if GitCommit != "" {
+				fmt.Printf("chitchat version %s (commit: %s)\n", Version, GitCommit)
+			} else {
+				fmt.Printf("chitchat version %s\n", Version)
+			}
 		},
 	}
 

@@ -15,14 +15,14 @@ GOFLAGS?=-mod=mod
 # Build directory
 BUILD_DIR=bin
 
-# Version information
-GIT_VERSION := $(shell git describe --tags --dirty --always 2>/dev/null)
-VERSION ?= $(if $(GIT_VERSION),$(GIT_VERSION),0.1.0-development)
-BUILD_TIME=$(shell date -u '+%Y-%m-%d_%H:%M:%S')
-GIT_COMMIT=$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+# Version information (derived from git tags automatically)
+GIT_VERSION := $(shell git describe --tags --always --dirty 2>/dev/null)
+VERSION ?= $(if $(GIT_VERSION),$(GIT_VERSION),0.1.0-dev)
+BUILD_TIME := $(shell date -u '+%Y-%m-%d_%H:%M:%S')
+GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
 # Ldflags for version injection
-LDFLAGS=-ldflags "-X main.Version=$(VERSION)"
+LDFLAGS := -ldflags "-X main.Version=$(VERSION) -X main.GitCommit=$(GIT_COMMIT) -X main.BuildTime=$(BUILD_TIME)"
 
 .PHONY: all build install clean test test-coverage test-integration tidy deps run build-all help
 
