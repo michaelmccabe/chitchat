@@ -1,0 +1,34 @@
+broker:
+  url: "amqp://guest:guest@localhost:5672/"
+  # Declarative topology setup of exchanges/queues if they do not exist
+  declarations:
+    exchanges:
+      - name: "order.exchange"
+        type: "topic"
+        durable: true
+    queues:
+      - name: "order.created.trigger"
+        durable: true
+        bindings:
+          - exchange: "order.exchange"
+            routing_key: "order.event.created"
+
+rules:
+  - name: "mock-payment-processing-flow"
+    trigger:
+      queue: "order.created.trigger"
+      jsonpath_rules:
+        - filter: "order.status"
+          equals: "pending"
+        - filter: "payment.method"
+          equals: "credit_card"
+    mock_response:
+      exchange: "order.exchange"
+      routing_key: "payment.event.processed"
+      delay_ms: 100
+      payload:
+        transaction_id: "tx_{{uuid}}"
+        order_id: "{{trigger.order.id}}"
+        amount: "{{trigger.payment.amount}}"
+        status: "settled"
+        processed_at: "{{system.utc_now}}"
