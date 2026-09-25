@@ -84,7 +84,7 @@ jobs:
           sha256sum * > checksums.txt
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.release_version.outputs.TAG }}
           name: Release ${{ steps.release_version.outputs.TAG }}
