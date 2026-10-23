@@ -64,6 +64,9 @@ lint: fmt vet
 	@if command -v golangci-lint >/dev/null 2>&1; then \
 		echo "Running golangci-lint..."; \
 		golangci-lint run ./...; \
+	elif [ -x "$$(go env GOPATH)/bin/golangci-lint" ]; then \
+		echo "Running $$(go env GOPATH)/bin/golangci-lint..."; \
+		"$$(go env GOPATH)/bin/golangci-lint" run ./...; \
 	else \
 		echo "golangci-lint not installed, skipping"; \
 	fi

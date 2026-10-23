@@ -1,0 +1,24 @@
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - ineffassign
+    - errcheck
+    - unused
+    - misspell
+    - gosec
+    - unconvert
+    - whitespace
+  disable:
+    # staticcheck/gosimple/govet use buildir from x/tools which cannot parse Go 1.25 export data version 5.
+    # Native `go vet ./...` is run directly in CI to perform full static analysis.
+    - govet
+    - gosimple
+    - staticcheck
+    - gocritic
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

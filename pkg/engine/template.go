@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand/v2"
+	rand "math/rand/v2"
 	"regexp"
 	"strings"
 	"text/template"

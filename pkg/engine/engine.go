@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"chitchat/pkg/broker"
@@ -32,8 +31,21 @@ type RuleStat struct {
 
 // ruleState pairs a rule with its runtime match counter.
 type ruleState struct {
+	mu      sync.Mutex
 	rule    config.Rule
-	matches atomic.Int64
+	matches int64
+}
+
+func (rs *ruleState) incMatches() {
+	rs.mu.Lock()
+	rs.matches++
+	rs.mu.Unlock()
+}
+
+func (rs *ruleState) getMatches() int64 {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.matches
 }
 
 func newRuleStates(rules []config.Rule) []*ruleState {
@@ -186,7 +198,7 @@ func (e *Engine) RuleStats() []RuleStat {
 			ResponseExchange:   rs.rule.MockResponse.Exchange,
 			ResponseRoutingKey: rs.rule.MockResponse.RoutingKey,
 			DelayMS:            rs.rule.MockResponse.DelayMS,
-			Matches:            rs.matches.Load(),
+			Matches:            rs.getMatches(),
 		}
 	}
 	return stats
@@ -237,7 +249,7 @@ func (e *Engine) handleMessage(msg broker.Message) {
 			continue
 		}
 		matched = true
-		rs.matches.Add(1)
+		rs.incMatches()
 		rule := rs.rule
 
 		e.logger.Info("matched rule",

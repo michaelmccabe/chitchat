@@ -18,8 +18,8 @@ import (
 	"chitchat/pkg/engine"
 	"chitchat/pkg/spy"
 	"github.com/google/uuid"
-	"github.com/rabbitmq/amqp091-go"
-	"github.com/testcontainers/testcontainers-go"
+	amqp091 "github.com/rabbitmq/amqp091-go"
+	testcontainers "github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/rabbitmq"
 )
 
