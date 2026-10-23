@@ -19,7 +19,6 @@ import (
 	"chitchat/pkg/spy"
 	"github.com/google/uuid"
 	amqp091 "github.com/rabbitmq/amqp091-go"
-	testcontainers "github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/rabbitmq"
 )
 
@@ -34,9 +33,7 @@ func getNextPort() int {
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	rabbitContainer, err := rabbitmq.RunContainer(ctx,
-		testcontainers.WithImage("rabbitmq:3.11-management"),
-	)
+	rabbitContainer, err := rabbitmq.Run(ctx, "rabbitmq:3.11-management")
 	if err != nil {
 		log.Fatalf("failed to start rabbitmq testcontainer: %v", err)
 	}
