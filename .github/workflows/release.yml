@@ -72,13 +72,13 @@ jobs:
           mkdir -p dist
           LDFLAGS="-s -w -X main.Version=${VERSION} -X main.GitCommit=${GIT_COMMIT} -X main.BuildTime=${BUILD_TIME}"
 
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-linux-amd64 ./cmd/chitchat
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-linux-arm64 ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/chitchat-linux-amd64 ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/chitchat-linux-arm64 ./cmd/chitchat
 
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-darwin-amd64 ./cmd/chitchat
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-darwin-arm64 ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/chitchat-darwin-amd64 ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/chitchat-darwin-arm64 ./cmd/chitchat
 
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-windows-amd64.exe ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/chitchat-windows-amd64.exe ./cmd/chitchat
 
           cd dist
           sha256sum * > checksums.txt

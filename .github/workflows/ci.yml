@@ -31,14 +31,22 @@ jobs:
           go-version: '1.25'
           cache: true
 
-      - name: Verify Dependencies
+      - name: Verify Dependencies & Formats
         run: |
           go mod verify
           go mod download
+          diff -u <(echo -n) <(gofmt -d .)
+          go vet ./...
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
 
       - name: Run Unit Tests
         run: |
-          go test -v -race -coverprofile=coverage.out ./pkg/...
+          go test -v -race -coverprofile=coverage.out ./pkg/... ./cmd/...
 
       - name: Run Integration Tests (Testcontainers)
         run: |
@@ -81,15 +89,15 @@ jobs:
           LDFLAGS="-s -w -X main.Version=${VERSION} -X main.GitCommit=${GIT_COMMIT} -X main.BuildTime=${BUILD_TIME}"
 
           # Linux AMD64 & ARM64
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-linux-amd64 ./cmd/chitchat
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-linux-arm64 ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/chitchat-linux-amd64 ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/chitchat-linux-arm64 ./cmd/chitchat
 
           # macOS (Darwin) AMD64 & ARM64 (Apple Silicon)
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-darwin-amd64 ./cmd/chitchat
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-darwin-arm64 ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/chitchat-darwin-amd64 ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/chitchat-darwin-arm64 ./cmd/chitchat
 
           # Windows AMD64
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -mod=mod -ldflags "$LDFLAGS" -o dist/chitchat-windows-amd64.exe ./cmd/chitchat
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/chitchat-windows-amd64.exe ./cmd/chitchat
 
           # Generate checksums
           cd dist

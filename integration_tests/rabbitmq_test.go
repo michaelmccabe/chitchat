@@ -771,4 +771,3 @@ func TestChitchatFanoutExchangeRouting(t *testing.T) {
 		}
 	}
 }
-

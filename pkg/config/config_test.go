@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -146,5 +147,131 @@ func TestLoadConfigFile(t *testing.T) {
 	_, err = LoadConfig(filepath.Join(tmpDir, "non-existent.yaml"))
 	if err == nil {
 		t.Errorf("expected error for non-existent file, got nil")
+	}
+}
+
+func TestConfig_Validation(t *testing.T) {
+	tests := []struct {
+		name      string
+		modify    func(c *Config)
+		wantError bool
+	}{
+		{
+			name: "valid config",
+			modify: func(c *Config) {
+				c.Broker.URL = "amqp://localhost:5672/"
+				c.Rules = []Rule{
+					{
+						Name: "r1",
+						Trigger: Trigger{
+							Queue: "q1",
+						},
+						MockResponse: MockResponse{
+							Exchange:   "ex1",
+							RoutingKey: "rk1",
+						},
+					},
+				}
+			},
+			wantError: false,
+		},
+		{
+			name: "invalid broker url scheme",
+			modify: func(c *Config) {
+				c.Broker.URL = "http://localhost:5672/"
+			},
+			wantError: true,
+		},
+		{
+			name: "duplicate rule names",
+			modify: func(c *Config) {
+				c.Rules = []Rule{
+					{Name: "dup", Trigger: Trigger{Queue: "q1"}, MockResponse: MockResponse{RoutingKey: "k1"}},
+					{Name: "dup", Trigger: Trigger{Queue: "q2"}, MockResponse: MockResponse{RoutingKey: "k2"}},
+				}
+			},
+			wantError: true,
+		},
+		{
+			name: "negative delay",
+			modify: func(c *Config) {
+				c.Rules = []Rule{
+					{Name: "r1", Trigger: Trigger{Queue: "q1"}, MockResponse: MockResponse{RoutingKey: "k1", DelayMS: -5}},
+				}
+			},
+			wantError: true,
+		},
+		{
+			name: "invalid server port",
+			modify: func(c *Config) {
+				c.Server.Port = 70000
+			},
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			tt.modify(cfg)
+			err := cfg.Validate()
+			if (err != nil) != tt.wantError {
+				t.Errorf("Validate() error = %v, wantError %v", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestConfig_WarningsAndLoopGuard(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Broker.Declarations.Queues = []QueueDeclaration{
+		{
+			Name: "order.created",
+			Bindings: []QueueBinding{
+				{Exchange: "order.exchange", RoutingKey: "order.#"},
+			},
+		},
+	}
+	cfg.Rules = []Rule{
+		{
+			Name: "order-flow",
+			Trigger: Trigger{
+				Queue: "order.created",
+			},
+			MockResponse: MockResponse{
+				Exchange:   "order.exchange",
+				RoutingKey: "order.item.created",
+			},
+		},
+	}
+
+	warns := cfg.Warnings()
+	foundLoop := false
+	for _, w := range warns {
+		if strings.Contains(w, "loop guard") {
+			foundLoop = true
+			break
+		}
+	}
+	if !foundLoop {
+		t.Errorf("expected warning about potential loop, got warnings: %v", warns)
+	}
+}
+
+func TestConfig_UnknownFields(t *testing.T) {
+	yamlWithTypos := `
+broker:
+  url: "amqp://localhost:5672/"
+rules:
+  - name: "test"
+    trigger:
+      queue: "q1"
+    mock_response:
+      routing_key: "rk1"
+      delay_msec: 100 # Typo! Should be delay_ms
+`
+	_, err := ParseConfig([]byte(yamlWithTypos))
+	if err == nil {
+		t.Fatalf("expected error on unknown YAML field 'delay_msec', got nil")
 	}
 }
