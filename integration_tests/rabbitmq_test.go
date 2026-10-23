@@ -402,9 +402,9 @@ func TestChitchatMultipleRulesAndFiltering(t *testing.T) {
 		t.Fatal("timed out waiting for cancelled mock response")
 	}
 
-	// Assert spy buffer captured all 3 messages
+	// Assert spy buffer captured all 3 received triggering messages
 	time.Sleep(100 * time.Millisecond)
-	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/_chitchat/messages", spyServer.Port()))
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/_chitchat/messages?direction=received", spyServer.Port()))
 	if err != nil {
 		t.Fatalf("failed to query spy: %v", err)
 	}
@@ -413,10 +413,10 @@ func TestChitchatMultipleRulesAndFiltering(t *testing.T) {
 	resp.Body.Close()
 
 	if len(msgsList) != 3 {
-		t.Errorf("expected 3 messages captured in spy buffer, got %d", len(msgsList))
+		t.Errorf("expected 3 received messages captured in spy buffer, got %d", len(msgsList))
 	}
 
-	// Assert REST /_chitchat/health endpoint
+	// Assert REST /_chitchat/health endpoint reports all 5 messages (3 received + 2 published mock responses)
 	healthResp, err := http.Get(fmt.Sprintf("http://localhost:%d/_chitchat/health", spyServer.Port()))
 	if err != nil {
 		t.Fatalf("failed to query health: %v", err)
@@ -424,7 +424,7 @@ func TestChitchatMultipleRulesAndFiltering(t *testing.T) {
 	var healthData map[string]interface{}
 	_ = json.NewDecoder(healthResp.Body).Decode(&healthData)
 	healthResp.Body.Close()
-	if healthData["status"] != "ok" || healthData["messages"] != float64(3) {
+	if healthData["status"] != "ok" || healthData["messages"] != float64(5) {
 		t.Errorf("unexpected health response: %v", healthData)
 	}
 
