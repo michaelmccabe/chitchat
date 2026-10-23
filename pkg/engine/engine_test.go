@@ -131,6 +131,96 @@ func TestRenderPayload(t *testing.T) {
 	}
 }
 
+func TestRenderPayload_EscapingAndTypedJSON(t *testing.T) {
+	payloadDef := map[string]interface{}{
+		"message":   "{{trigger.input}}",
+		"count":     "{{trigger.count | json}}",
+		"is_active": "{{json trigger.active}}",
+	}
+
+	// Input contains quotes, backslashes, and newlines that would break naive JSON concatenation
+	msg := broker.Message{
+		Body: []byte(`{
+			"input": "Hello \"world\" \n test",
+			"count": 42,
+			"active": true
+		}`),
+	}
+
+	renderedBytes, err := RenderPayload(payloadDef, msg)
+	if err != nil {
+		t.Fatalf("RenderPayload failed: %v", err)
+	}
+
+	var res map[string]interface{}
+	if err := json.Unmarshal(renderedBytes, &res); err != nil {
+		t.Fatalf("rendered payload is not valid JSON: %v; raw: %s", err, string(renderedBytes))
+	}
+
+	if res["message"] != "Hello \"world\" \n test" {
+		t.Errorf("expected properly escaped string, got %q", res["message"])
+	}
+	if count, ok := res["count"].(float64); !ok || count != 42 {
+		t.Errorf("expected count to be typed number 42, got %v (%T)", res["count"], res["count"])
+	}
+	if active, ok := res["is_active"].(bool); !ok || !active {
+		t.Errorf("expected is_active to be typed boolean true, got %v (%T)", res["is_active"], res["is_active"])
+	}
+}
+
+func TestEngine_LoopGuard(t *testing.T) {
+	cfg := &config.Config{
+		Broker: config.BrokerConfig{
+			URL: "amqp://localhost:5672",
+		},
+		Rules: []config.Rule{
+			{
+				Name: "echo-rule",
+				Trigger: config.Trigger{
+					Queue: "echo.queue",
+				},
+				MockResponse: config.MockResponse{
+					RoutingKey: "echo.queue",
+					Payload: map[string]interface{}{
+						"echo": true,
+					},
+				},
+			},
+		},
+	}
+
+	mockDriver := broker.NewMockDriver()
+	spy := &testSpyRecorder{}
+	eng := NewEngine(cfg, mockDriver, spy)
+	if err := eng.Start(); err != nil {
+		t.Fatalf("failed to start engine: %v", err)
+	}
+	defer eng.Stop(context.Background())
+
+	// Simulate incoming message with chitchat origin header (loop guard)
+	headers := map[string]interface{}{
+		config.OriginHeader: "echo-rule",
+	}
+	if err := mockDriver.SimulateIncomingMessage("echo.queue", "echo.queue", []byte(`{"ping":1}`), headers); err != nil {
+		t.Fatalf("failed to simulate message: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Since it had the origin header, no mock response should have been published
+	if len(mockDriver.GetPublished()) != 0 {
+		t.Fatalf("expected 0 published messages due to loop guard, got %d", len(mockDriver.GetPublished()))
+	}
+
+	// But it SHOULD be recorded in the spy buffer
+	spy.mu.Lock()
+	count := len(spy.recorded)
+	spy.mu.Unlock()
+	if count != 1 {
+		t.Errorf("expected spy to record 1 message even if ignored by rules, got %d", count)
+	}
+}
+
 func TestEngine_EndToEnd(t *testing.T) {
 	cfg := &config.Config{
 		Broker: config.BrokerConfig{
@@ -200,12 +290,20 @@ func TestEngine_EndToEnd(t *testing.T) {
 		t.Errorf("expected status 'settled', got %s", status)
 	}
 
-	// Check spy recorded
+	// Check spy recorded both received trigger and published mock response
 	spy.mu.Lock()
 	recCount := len(spy.recorded)
+	recordedCopy := make([]broker.Message, len(spy.recorded))
+	copy(recordedCopy, spy.recorded)
 	spy.mu.Unlock()
-	if recCount != 1 {
-		t.Errorf("expected 1 spy recorded message, got %d", recCount)
+	if recCount != 2 {
+		t.Fatalf("expected 2 spy recorded messages (received + published), got %d", recCount)
+	}
+	if recordedCopy[0].Direction != broker.DirectionReceived {
+		t.Errorf("expected first recorded message to have direction %q, got %q", broker.DirectionReceived, recordedCopy[0].Direction)
+	}
+	if recordedCopy[1].Direction != broker.DirectionPublished {
+		t.Errorf("expected second recorded message to have direction %q, got %q", broker.DirectionPublished, recordedCopy[1].Direction)
 	}
 
 	if err := eng.Stop(context.Background()); err != nil {

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"chitchat/pkg/broker"
 )
@@ -123,10 +124,96 @@ func TestHTTPSpyEndpoints(t *testing.T) {
 	}
 
 	// 4. Test Method Not Allowed
-	reqBad := httptest.NewRequest(http.MethodPost, "/_chitchat/messages", nil)
+	reqBad := httptest.NewRequest(http.MethodPut, "/_chitchat/clear", nil)
 	recBad := httptest.NewRecorder()
-	server.handleMessages(recBad, reqBad)
+	server.handleClear(recBad, reqBad)
 	if recBad.Code != http.StatusMethodNotAllowed {
 		t.Errorf("expected status 405, got %d", recBad.Code)
+	}
+
+	// 5. Test DELETE /_chitchat/messages (clears buffer)
+	rb.Record(broker.Message{Queue: "q1", Body: []byte(`{}`)})
+	reqDel := httptest.NewRequest(http.MethodDelete, "/_chitchat/messages", nil)
+	recDel := httptest.NewRecorder()
+	server.handleMessages(recDel, reqDel)
+	if recDel.Code != http.StatusOK {
+		t.Fatalf("expected status 200 on DELETE, got %d", recDel.Code)
+	}
+	if rb.Count() != 0 {
+		t.Errorf("expected 0 messages after DELETE /_chitchat/messages, got %d", rb.Count())
+	}
+}
+
+func TestHTTPSpyEndpoints_WaitForAndAdvancedFilters(t *testing.T) {
+	rb := NewRingBuffer(10)
+	server := NewServer(8082, rb)
+
+	// Test wait_for unblocks when message arrives
+	done := make(chan struct{})
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/_chitchat/messages?wait_for=1&timeout=2s&direction=published", nil)
+		rec := httptest.NewRecorder()
+		server.handleMessages(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200 OK from wait_for, got %d", rec.Code)
+		}
+		var msgs []CapturedMessage
+		_ = json.Unmarshal(rec.Body.Bytes(), &msgs)
+		if len(msgs) != 1 {
+			t.Errorf("expected 1 published message, got %d", len(msgs))
+		}
+		close(done)
+	}()
+
+	// Wait briefly and record published message
+	time.Sleep(50 * time.Millisecond)
+	rb.Record(broker.Message{
+		Direction:  broker.DirectionPublished,
+		Exchange:   "order.exchange",
+		RoutingKey: "order.processed",
+		Body:       []byte(`{"result":"ok"}`),
+	})
+
+	select {
+	case <-done:
+		// success
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for wait_for long-poll to return")
+	}
+}
+
+func TestHTTPSpyEndpoints_RulesAndReload(t *testing.T) {
+	rb := NewRingBuffer(10)
+	server := NewServer(8082, rb)
+
+	server.SetRulesProvider(func() interface{} {
+		return []map[string]interface{}{
+			{"name": "test-rule", "matches": 5},
+		}
+	})
+
+	reloadCalled := false
+	server.SetReloader(func() (interface{}, error) {
+		reloadCalled = true
+		return map[string]string{"status": "ok"}, nil
+	})
+
+	// 1. GET /_chitchat/rules
+	reqRules := httptest.NewRequest(http.MethodGet, "/_chitchat/rules", nil)
+	recRules := httptest.NewRecorder()
+	server.handleRules(recRules, reqRules)
+	if recRules.Code != http.StatusOK {
+		t.Fatalf("expected 200 on /_chitchat/rules, got %d", recRules.Code)
+	}
+
+	// 2. POST /_chitchat/reload
+	reqReload := httptest.NewRequest(http.MethodPost, "/_chitchat/reload", nil)
+	recReload := httptest.NewRecorder()
+	server.handleReload(recReload, reqReload)
+	if recReload.Code != http.StatusOK {
+		t.Fatalf("expected 200 on /_chitchat/reload, got %d", recReload.Code)
+	}
+	if !reloadCalled {
+		t.Errorf("expected reloader hook to be called")
 	}
 }

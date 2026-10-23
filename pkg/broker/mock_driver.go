@@ -17,14 +17,16 @@ type PublishedMessage struct {
 
 // MockDriver is an in-memory test driver implementing the Driver interface.
 type MockDriver struct {
-	mu           sync.Mutex
-	Connected    bool
-	URL          string
-	Topology     *config.Declarations
-	Consumers    map[string]chan<- Message
-	Published    []PublishedMessage
-	Closed       bool
-	PublishHook  func(exchange, routingKey string, body []byte, headers map[string]interface{}) error
+	mu          sync.Mutex
+	Connected   bool
+	URL         string
+	Topology    *config.Declarations
+	Consumers   map[string]chan<- Message
+	Published   []PublishedMessage
+	Closed      bool
+	PublishHook func(exchange, routingKey string, body []byte, headers map[string]interface{}) error
+
+	done chan struct{}
 }
 
 // NewMockDriver creates a new MockDriver instance.
@@ -32,6 +34,7 @@ func NewMockDriver() *MockDriver {
 	return &MockDriver{
 		Consumers: make(map[string]chan<- Message),
 		Published: make([]PublishedMessage, 0),
+		done:      make(chan struct{}),
 	}
 }
 
@@ -76,14 +79,20 @@ func (m *MockDriver) Publish(exchange, routingKey string, body []byte, headers m
 	return nil
 }
 
+// Close marks the driver as closed and releases any blocked SimulateIncomingMessage
+// callers, mirroring how real drivers stop their consumer goroutines on Close.
 func (m *MockDriver) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.Closed = true
+	if !m.Closed {
+		m.Closed = true
+		close(m.done)
+	}
 	return nil
 }
 
 // SimulateIncomingMessage pushes a message to a registered consumer queue.
+// It blocks until the consumer accepts the message or the driver is closed.
 func (m *MockDriver) SimulateIncomingMessage(queue, routingKey string, body []byte, headers map[string]interface{}) error {
 	m.mu.Lock()
 	ch, ok := m.Consumers[queue]
@@ -93,13 +102,19 @@ func (m *MockDriver) SimulateIncomingMessage(queue, routingKey string, body []by
 		return fmt.Errorf("no consumer registered for queue %q", queue)
 	}
 
-	ch <- Message{
+	msg := Message{
 		Queue:      queue,
 		RoutingKey: routingKey,
 		Headers:    headers,
 		Body:       body,
 	}
-	return nil
+
+	select {
+	case ch <- msg:
+		return nil
+	case <-m.done:
+		return fmt.Errorf("mock driver is closed")
+	}
 }
 
 // GetPublished returns a copy of published messages.

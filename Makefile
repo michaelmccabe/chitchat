@@ -10,7 +10,6 @@ GOCLEAN=$(GOCMD) clean
 GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
 GOINSTALL=$(GOCMD) install
-GOFLAGS?=-mod=mod
 
 # Build directory
 BUILD_DIR=bin
@@ -24,7 +23,7 @@ GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 # Ldflags for version injection
 LDFLAGS := -ldflags "-X main.Version=$(VERSION) -X main.GitCommit=$(GIT_COMMIT) -X main.BuildTime=$(BUILD_TIME)"
 
-.PHONY: all build install clean test test-coverage test-integration tidy deps run build-all help
+.PHONY: all build install clean test test-coverage test-integration tidy deps run build-all fmt vet lint help
 
 # Default target
 all: clean test build
@@ -33,13 +32,13 @@ all: clean test build
 build:
 	@echo "Building $(BINARY_NAME)..."
 	@mkdir -p $(BUILD_DIR)
-	$(GOBUILD) $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/chitchat
+	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/chitchat
 	@echo "Build complete: $(BUILD_DIR)/$(BINARY_NAME)"
 
 # Install the binary to $GOPATH/bin or $GOBIN
 install:
 	@echo "Installing $(BINARY_NAME)..."
-	$(GOINSTALL) $(GOFLAGS) $(LDFLAGS) ./cmd/chitchat
+	$(GOINSTALL) $(LDFLAGS) ./cmd/chitchat
 	@echo "Installation complete. Binary installed to $(shell go env GOPATH)/bin/$(BINARY_NAME)"
 	@echo "Make sure $(shell go env GOPATH)/bin is in your PATH"
 
@@ -50,22 +49,44 @@ clean:
 	@rm -rf $(BUILD_DIR) coverage.out coverage.html
 	@echo "Clean complete"
 
+# Format go code
+fmt:
+	@echo "Formatting code..."
+	gofmt -w .
+
+# Run vet
+vet:
+	@echo "Running go vet..."
+	$(GOCMD) vet ./...
+
+# Lint placeholder or golangci-lint if installed
+lint: fmt vet
+	@if command -v golangci-lint >/dev/null 2>&1; then \
+		echo "Running golangci-lint..."; \
+		golangci-lint run ./...; \
+	elif [ -x "$$(go env GOPATH)/bin/golangci-lint" ]; then \
+		echo "Running $$(go env GOPATH)/bin/golangci-lint..."; \
+		"$$(go env GOPATH)/bin/golangci-lint" run ./...; \
+	else \
+		echo "golangci-lint not installed, skipping"; \
+	fi
+
 # Run unit tests
 test:
 	@echo "Running unit tests..."
-	$(GOTEST) $(GOFLAGS) -v -race ./pkg/...
+	$(GOTEST) -v -race ./pkg/... ./cmd/...
 
 # Run tests with coverage
 test-coverage:
 	@echo "Running tests with coverage..."
-	$(GOTEST) $(GOFLAGS) -v -race -coverprofile=coverage.out ./pkg/...
+	$(GOTEST) -v -race -coverprofile=coverage.out ./pkg/... ./cmd/...
 	$(GOCMD) tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated: coverage.html"
 
 # Run integration tests (requires Docker)
 test-integration:
 	@echo "Running integration tests..."
-	$(GOTEST) $(GOFLAGS) -v -timeout 10m ./integration_tests/...
+	$(GOTEST) -v -timeout 10m ./integration_tests/...
 
 # Tidy dependencies
 tidy:
@@ -87,11 +108,11 @@ run: build
 build-all: clean
 	@echo "Building for multiple platforms..."
 	@mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=amd64 $(GOBUILD) $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/chitchat
-	GOOS=linux GOARCH=arm64 $(GOBUILD) $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-arm64 ./cmd/chitchat
-	GOOS=darwin GOARCH=amd64 $(GOBUILD) $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 ./cmd/chitchat
-	GOOS=darwin GOARCH=arm64 $(GOBUILD) $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 ./cmd/chitchat
-	GOOS=windows GOARCH=amd64 $(GOBUILD) $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-windows-amd64.exe ./cmd/chitchat
+	GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/chitchat
+	GOOS=linux GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-arm64 ./cmd/chitchat
+	GOOS=darwin GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 ./cmd/chitchat
+	GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 ./cmd/chitchat
+	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-windows-amd64.exe ./cmd/chitchat
 	@echo "Multi-platform build complete"
 
 # Help target
@@ -100,6 +121,9 @@ help:
 	@echo "  make build             - Build the binary"
 	@echo "  make install           - Install binary to GOPATH/bin (globally accessible)"
 	@echo "  make clean             - Remove build artifacts"
+	@echo "  make fmt               - Format Go source code"
+	@echo "  make vet               - Run go vet"
+	@echo "  make lint              - Format, vet, and run golangci-lint if installed"
 	@echo "  make test              - Run unit tests"
 	@echo "  make test-coverage     - Run tests with coverage report"
 	@echo "  make test-integration  - Run Testcontainers integration tests"

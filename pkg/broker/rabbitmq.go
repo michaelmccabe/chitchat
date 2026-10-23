@@ -21,6 +21,8 @@ type RabbitMQDriver struct {
 	logger     *slog.Logger
 	ctx        context.Context
 	cancelFunc context.CancelFunc
+	// consumers tracks running consumer goroutines; Close waits on it.
+	consumers sync.WaitGroup
 }
 
 // NewRabbitMQDriver creates a new RabbitMQ broker driver.
@@ -52,7 +54,7 @@ func (r *RabbitMQDriver) Connect(amqpURL string) error {
 
 	ch, err := conn.Channel()
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return fmt.Errorf("failed to open rabbitmq channel: %w", err)
 	}
 
@@ -148,7 +150,7 @@ func (r *RabbitMQDriver) DeclareTopology(declarations *config.Declarations) erro
 }
 
 // StartConsuming attaches a consumer loop to the given queue and pipes deliveries to messageChan.
-// StartConsuming attaches a consumer loop to the given queue.
+// The consumer goroutine is tracked by the driver and stopped (and waited for) in Close.
 // Note: The consumer goroutine reads r.ctx and writes to messageChan without holding the lock.
 // This is safe because r.ctx is immutable after construction.
 func (r *RabbitMQDriver) StartConsuming(queue string, messageChan chan<- Message) error {
@@ -174,7 +176,11 @@ func (r *RabbitMQDriver) StartConsuming(queue string, messageChan chan<- Message
 
 	r.logger.Info("started consuming", "queue", queue)
 
+	// Safe against Close: we hold the read lock, so Close cannot be waiting on the
+	// WaitGroup yet (it takes the write lock first).
+	r.consumers.Add(1)
 	go func() {
+		defer r.consumers.Done()
 		for {
 			select {
 			case <-r.ctx.Done():
@@ -195,6 +201,8 @@ func (r *RabbitMQDriver) StartConsuming(queue string, messageChan chan<- Message
 					RoutingKey: d.RoutingKey,
 					Headers:    headers,
 					Body:       d.Body,
+					Direction:  DirectionReceived,
+					MessageID:  d.MessageId,
 				}
 
 				r.logger.Debug("received message",
@@ -264,6 +272,8 @@ func (r *RabbitMQDriver) Publish(exchange, routingKey string, body []byte, heade
 }
 
 // Close cleanly shuts down consumer loops, channels, and connection.
+// It blocks until all consumer goroutines have exited, so after it returns nothing
+// will write to a message channel previously passed to StartConsuming.
 func (r *RabbitMQDriver) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -288,6 +298,9 @@ func (r *RabbitMQDriver) Close() error {
 			firstErr = err
 		}
 	}
+
+	// Consumers exit on ctx cancellation or when the delivery channel closes.
+	r.consumers.Wait()
 
 	r.logger.Info("closed rabbitmq connection")
 	return firstErr

@@ -1,10 +1,13 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 
-	"gopkg.in/yaml.v3"
+	yaml "gopkg.in/yaml.v3"
 )
 
 // Config represents the root configuration structure for chitchat.
@@ -12,7 +15,14 @@ type Config struct {
 	Broker  BrokerConfig `yaml:"broker"`
 	Server  ServerConfig `yaml:"server,omitempty"`
 	Logging LogConfig    `yaml:"logging,omitempty"`
+	Spy     SpyConfig    `yaml:"spy,omitempty"`
 	Rules   []Rule       `yaml:"rules"`
+}
+
+// SpyConfig lists additional queues that are consumed purely for spying, i.e. they are
+// captured by the REST spy API without needing a rule that triggers on them.
+type SpyConfig struct {
+	Queues []string `yaml:"queues,omitempty"`
 }
 
 // BrokerConfig holds the message broker connection and declarative topology configurations.
@@ -88,8 +98,11 @@ type MockResponse struct {
 
 // ServerConfig holds HTTP Spy Server configurations.
 type ServerConfig struct {
-	Port           int `yaml:"port,omitempty"`
-	RingBufferSize int `yaml:"ring_buffer_size,omitempty"`
+	// Host is the interface the spy server binds to. Empty means all interfaces;
+	// use 127.0.0.1 to restrict access to the local machine.
+	Host           string `yaml:"host,omitempty"`
+	Port           int    `yaml:"port,omitempty"`
+	RingBufferSize int    `yaml:"ring_buffer_size,omitempty"`
 }
 
 // LogConfig holds logging configuration parameters.
@@ -126,9 +139,12 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // ParseConfig unmarshals YAML bytes into a Config struct and applies defaults.
+// Unknown YAML keys are rejected so typos are reported instead of silently ignored.
 func ParseConfig(data []byte) (*Config, error) {
 	cfg := DefaultConfig()
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("failed to parse yaml config: %w", err)
 	}
 
