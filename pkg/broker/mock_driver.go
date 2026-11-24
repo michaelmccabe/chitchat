@@ -46,6 +46,13 @@ func (m *MockDriver) Connect(rawURL string) error {
 	return nil
 }
 
+// IsConnected reports whether the mock driver is currently connected and not closed.
+func (m *MockDriver) IsConnected() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.Connected && !m.Closed
+}
+
 func (m *MockDriver) DeclareTopology(declarations *config.Declarations) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

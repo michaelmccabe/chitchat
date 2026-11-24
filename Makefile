@@ -23,7 +23,7 @@ GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 # Ldflags for version injection
 LDFLAGS := -ldflags "-X main.Version=$(VERSION) -X main.GitCommit=$(GIT_COMMIT) -X main.BuildTime=$(BUILD_TIME)"
 
-.PHONY: all build install clean test test-coverage test-integration tidy deps run build-all fmt vet lint help
+.PHONY: all build install clean test test-coverage test-integration tidy deps run build-all docker fmt vet lint help
 
 # Default target
 all: clean test build
@@ -115,6 +115,16 @@ build-all: clean
 	GOOS=windows GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-windows-amd64.exe ./cmd/chitchat
 	@echo "Multi-platform build complete"
 
+# Build Docker image
+docker:
+	@echo "Building Docker image $(BINARY_NAME):$(VERSION)..."
+	docker build \
+		--build-arg VERSION="$(VERSION)" \
+		--build-arg GIT_COMMIT="$(GIT_COMMIT)" \
+		--build-arg BUILD_TIME="$(BUILD_TIME)" \
+		-t $(BINARY_NAME):$(VERSION) \
+		-t $(BINARY_NAME):latest .
+
 # Help target
 help:
 	@echo "Available targets:"
@@ -131,4 +141,5 @@ help:
 	@echo "  make deps              - Download dependencies"
 	@echo "  make run               - Run the application"
 	@echo "  make build-all         - Build for multiple platforms"
+	@echo "  make docker            - Build static Docker image"
 	@echo "  make help              - Show this help message"

@@ -1,0 +1,31 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  chitchat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    ports:
+      - "8082:8082"
+    volumes:
+      - ./chitchat-rules.yaml:/etc/chitchat/chitchat-rules.yaml:ro
+    command:
+      - "start"
+      - "--config"
+      - "/etc/chitchat/chitchat-rules.yaml"
+      - "--broker-url"
+      - "amqp://guest:guest@rabbitmq:5672/"
+      - "--connect-timeout"
+      - "30s"

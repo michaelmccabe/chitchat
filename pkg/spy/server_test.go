@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -215,5 +217,118 @@ func TestHTTPSpyEndpoints_RulesAndReload(t *testing.T) {
 	}
 	if !reloadCalled {
 		t.Errorf("expected reloader hook to be called")
+	}
+}
+
+func TestHTTPSpyEndpoints_NeutralAliasesAndSinceTimestamp(t *testing.T) {
+	rb := NewRingBuffer(10)
+	rb.Record(broker.Message{
+		Queue:      "orders.topic",
+		RoutingKey: "order.created",
+		Headers:    map[string]interface{}{"x-raw": []byte("hello")},
+		Body:       []byte(`{"id": 1}`),
+	})
+	midpoint := time.Now().UTC()
+	time.Sleep(5 * time.Millisecond)
+	rb.Record(broker.Message{
+		Direction:  broker.DirectionPublished,
+		Exchange:   "payments.dest",
+		RoutingKey: "payment.done",
+		Body:       []byte(`{"id": 2}`),
+	})
+
+	server := NewServer(8082, rb)
+
+	// Query with neutral aliases ?source=...&key=...
+	req := httptest.NewRequest(http.MethodGet, "/_chitchat/messages?source=orders.topic&key=order.created", nil)
+	rec := httptest.NewRecorder()
+	server.handleMessages(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var msgs []CapturedMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &msgs); err != nil {
+		t.Fatalf("failed to decode: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message matching source & key aliases, got %d", len(msgs))
+	}
+	if msgs[0].Headers["x-raw"] != "hello" {
+		t.Errorf("expected []byte header to normalize to string 'hello', got %v", msgs[0].Headers["x-raw"])
+	}
+
+	// Query with destination alias + RFC3339 since timestamp
+	tsParam := url.QueryEscape(midpoint.Format(time.RFC3339Nano))
+	req2 := httptest.NewRequest(http.MethodGet, "/_chitchat/messages?destination=payments.dest&since="+tsParam, nil)
+	rec2 := httptest.NewRecorder()
+	server.handleMessages(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 for since timestamp, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	var msgs2 []CapturedMessage
+	_ = json.Unmarshal(rec2.Body.Bytes(), &msgs2)
+	if len(msgs2) != 1 || msgs2[0].RoutingKey != "payment.done" {
+		t.Errorf("expected 1 message after midpoint timestamp, got %+v", msgs2)
+	}
+}
+
+func TestHTTPSpyEndpoints_HealthAndMetrics(t *testing.T) {
+	rb := NewRingBuffer(10)
+	rb.Record(broker.Message{Queue: "q1", Body: []byte(`{}`)})
+	server := NewServer(8082, rb)
+
+	connected := true
+	server.SetHealthProvider(func() HealthSnapshot {
+		return HealthSnapshot{
+			BrokerConnected:   connected,
+			SubscribedQueues:  []string{"q1", "q2"},
+			Rules:             3,
+			MessagesReceived:  10,
+			MessagesPublished: 7,
+			RulesMatched:      7,
+			Errors:            1,
+		}
+	})
+
+	// Healthy -> 200 OK
+	rec := httptest.NewRecorder()
+	server.handleHealth(rec, httptest.NewRequest(http.MethodGet, "/_chitchat/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 when broker connected, got %d", rec.Code)
+	}
+	var health map[string]interface{}
+	_ = json.Unmarshal(rec.Body.Bytes(), &health)
+	if health["status"] != "ok" || health["broker_connected"] != true || health["rules"] != float64(3) {
+		t.Errorf("unexpected health payload: %v", health)
+	}
+
+	// Disconnected -> 503 Service Unavailable
+	connected = false
+	recDown := httptest.NewRecorder()
+	server.handleHealth(recDown, httptest.NewRequest(http.MethodGet, "/_chitchat/health", nil))
+	if recDown.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when broker disconnected, got %d", recDown.Code)
+	}
+
+	// Metrics endpoint -> Prometheus text format
+	recMetrics := httptest.NewRecorder()
+	server.handleMetrics(recMetrics, httptest.NewRequest(http.MethodGet, "/_chitchat/metrics", nil))
+	if recMetrics.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /_chitchat/metrics, got %d", recMetrics.Code)
+	}
+	body := recMetrics.Body.String()
+	for _, expected := range []string{
+		"chitchat_broker_connected 0",
+		"chitchat_buffer_messages 1",
+		"chitchat_subscribed_queues 2",
+		"chitchat_rules_loaded 3",
+		"chitchat_messages_received_total 10",
+		"chitchat_messages_published_total 7",
+		"chitchat_rules_matched_total 7",
+		"chitchat_errors_total 1",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Errorf("metrics output missing %q:\n%s", expected, body)
+		}
 	}
 }

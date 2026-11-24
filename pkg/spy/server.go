@@ -59,6 +59,8 @@ type Filter struct {
 	Body []BodyFilter
 	// SinceSeq returns only messages with Seq greater than this value.
 	SinceSeq uint64
+	// SinceTime returns only messages with Timestamp strictly after this value.
+	SinceTime time.Time
 	// Limit keeps only the most recent N matching messages (0 = no limit).
 	Limit int
 }
@@ -86,6 +88,9 @@ func (f Filter) matches(m *CapturedMessage) bool {
 		return false
 	}
 	if f.SinceSeq > 0 && m.Seq <= f.SinceSeq {
+		return false
+	}
+	if !f.SinceTime.IsZero() && !m.Timestamp.After(f.SinceTime) {
 		return false
 	}
 	for name, want := range f.Headers {
@@ -270,6 +275,20 @@ type RulesProvider func() interface{}
 // Reloader re-reads the configuration and applies it. It returns a JSON-serialisable summary.
 type Reloader func() (interface{}, error)
 
+// HealthSnapshot reports live broker connectivity, subscribed queues, rules, and counters.
+type HealthSnapshot struct {
+	BrokerConnected   bool     `json:"broker_connected"`
+	SubscribedQueues  []string `json:"subscribed_queues,omitempty"`
+	Rules             int      `json:"rules"`
+	MessagesReceived  int64    `json:"messages_received"`
+	MessagesPublished int64    `json:"messages_published"`
+	RulesMatched      int64    `json:"rules_matched"`
+	Errors            int64    `json:"errors"`
+}
+
+// HealthProvider returns a current HealthSnapshot for /_chitchat/health and /_chitchat/metrics.
+type HealthProvider func() HealthSnapshot
+
 // Server exposes the REST spy API endpoint over HTTP.
 type Server struct {
 	buffer     *RingBuffer
@@ -281,6 +300,7 @@ type Server struct {
 	hooksMu  sync.RWMutex
 	rules    RulesProvider
 	reloader Reloader
+	health   HealthProvider
 }
 
 // NewServer creates a new Spy REST API Server.
@@ -302,6 +322,7 @@ func NewServer(port int, buffer *RingBuffer) *Server {
 	mux.HandleFunc("/_chitchat/messages", s.handleMessages)
 	mux.HandleFunc("/_chitchat/clear", s.handleClear)
 	mux.HandleFunc("/_chitchat/health", s.handleHealth)
+	mux.HandleFunc("/_chitchat/metrics", s.handleMetrics)
 	mux.HandleFunc("/_chitchat/rules", s.handleRules)
 	mux.HandleFunc("/_chitchat/reload", s.handleReload)
 
@@ -332,6 +353,13 @@ func (s *Server) SetReloader(r Reloader) {
 	s.hooksMu.Lock()
 	defer s.hooksMu.Unlock()
 	s.reloader = r
+}
+
+// SetHealthProvider registers the source for GET /_chitchat/health and GET /_chitchat/metrics.
+func (s *Server) SetHealthProvider(p HealthProvider) {
+	s.hooksMu.Lock()
+	defer s.hooksMu.Unlock()
+	s.health = p
 }
 
 // Start launches the HTTP spy server in the background.
@@ -388,13 +416,23 @@ func splitKV(s string) (string, *string) {
 	return s, nil
 }
 
+func firstQuery(q url.Values, keys ...string) string {
+	for _, k := range keys {
+		if v := q.Get(k); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // parseFilter builds a Filter from query parameters:
-// queue, exchange, routing_key, direction, rule, since, limit, header=name[=value], body=path[=value].
+// queue (or source/topic), exchange (or destination), routing_key (or key), direction, rule,
+// since (sequence ID or RFC3339 timestamp), limit, header=name[=value], body=path[=value].
 func parseFilter(q url.Values) (Filter, error) {
 	f := Filter{
-		Queue:      q.Get("queue"),
-		Exchange:   q.Get("exchange"),
-		RoutingKey: q.Get("routing_key"),
+		Queue:      firstQuery(q, "queue", "source", "topic"),
+		Exchange:   firstQuery(q, "exchange", "destination"),
+		RoutingKey: firstQuery(q, "routing_key", "key"),
 		Direction:  q.Get("direction"),
 		Rule:       q.Get("rule"),
 	}
@@ -402,11 +440,13 @@ func parseFilter(q url.Values) (Filter, error) {
 		return f, fmt.Errorf("invalid direction %q (expected %q or %q)", f.Direction, broker.DirectionReceived, broker.DirectionPublished)
 	}
 	if v := q.Get("since"); v != "" {
-		n, err := strconv.ParseUint(v, 10, 64)
-		if err != nil {
-			return f, fmt.Errorf("invalid since %q: must be a non-negative integer", v)
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			f.SinceSeq = n
+		} else if ts, terr := time.Parse(time.RFC3339Nano, v); terr == nil {
+			f.SinceTime = ts
+		} else {
+			return f, fmt.Errorf("invalid since %q: must be a non-negative integer sequence ID or RFC3339 timestamp", v)
 		}
-		f.SinceSeq = n
 	}
 	if v := q.Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -548,10 +588,84 @@ func (s *Server) handleClear2(w http.ResponseWriter) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":   "ok",
-		"messages": s.buffer.Count(),
+	s.hooksMu.RLock()
+	provider := s.health
+	s.hooksMu.RUnlock()
+
+	if provider == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":   "ok",
+			"messages": s.buffer.Count(),
+		})
+		return
+	}
+
+	h := provider()
+	status := http.StatusOK
+	state := "ok"
+	if !h.BrokerConnected {
+		status = http.StatusServiceUnavailable
+		state = "degraded"
+	}
+
+	writeJSON(w, status, map[string]interface{}{
+		"status":             state,
+		"broker_connected":   h.BrokerConnected,
+		"subscribed_queues":  h.SubscribedQueues,
+		"rules":              h.Rules,
+		"messages":           s.buffer.Count(),
+		"messages_received":  h.MessagesReceived,
+		"messages_published": h.MessagesPublished,
+		"rules_matched":      h.RulesMatched,
+		"errors":             h.Errors,
 	})
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.hooksMu.RLock()
+	provider := s.health
+	s.hooksMu.RUnlock()
+
+	var h HealthSnapshot
+	connected := 1
+	if provider != nil {
+		h = provider()
+		if !h.BrokerConnected {
+			connected = 0
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "# HELP chitchat_broker_connected Whether chitchat is currently connected to the broker (1=connected, 0=disconnected).\n")
+	fmt.Fprintf(w, "# TYPE chitchat_broker_connected gauge\n")
+	fmt.Fprintf(w, "chitchat_broker_connected %d\n", connected)
+	fmt.Fprintf(w, "# HELP chitchat_buffer_messages Current number of messages stored in the spy ring buffer.\n")
+	fmt.Fprintf(w, "# TYPE chitchat_buffer_messages gauge\n")
+	fmt.Fprintf(w, "chitchat_buffer_messages %d\n", s.buffer.Count())
+	fmt.Fprintf(w, "# HELP chitchat_subscribed_queues Number of subscribed broker queues/sources.\n")
+	fmt.Fprintf(w, "# TYPE chitchat_subscribed_queues gauge\n")
+	fmt.Fprintf(w, "chitchat_subscribed_queues %d\n", len(h.SubscribedQueues))
+	fmt.Fprintf(w, "# HELP chitchat_rules_loaded Number of loaded mock rules.\n")
+	fmt.Fprintf(w, "# TYPE chitchat_rules_loaded gauge\n")
+	fmt.Fprintf(w, "chitchat_rules_loaded %d\n", h.Rules)
+	fmt.Fprintf(w, "# HELP chitchat_messages_received_total Total number of broker messages received.\n")
+	fmt.Fprintf(w, "# TYPE chitchat_messages_received_total counter\n")
+	fmt.Fprintf(w, "chitchat_messages_received_total %d\n", h.MessagesReceived)
+	fmt.Fprintf(w, "# HELP chitchat_messages_published_total Total number of mock responses published.\n")
+	fmt.Fprintf(w, "# TYPE chitchat_messages_published_total counter\n")
+	fmt.Fprintf(w, "chitchat_messages_published_total %d\n", h.MessagesPublished)
+	fmt.Fprintf(w, "# HELP chitchat_rules_matched_total Total number of rule matches.\n")
+	fmt.Fprintf(w, "# TYPE chitchat_rules_matched_total counter\n")
+	fmt.Fprintf(w, "chitchat_rules_matched_total %d\n", h.RulesMatched)
+	fmt.Fprintf(w, "# HELP chitchat_errors_total Total number of template rendering or publish errors.\n")
+	fmt.Fprintf(w, "# TYPE chitchat_errors_total counter\n")
+	fmt.Fprintf(w, "chitchat_errors_total %d\n", h.Errors)
 }
 
 func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {

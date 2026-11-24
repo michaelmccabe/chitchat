@@ -3,8 +3,11 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -308,5 +311,346 @@ func TestEngine_EndToEnd(t *testing.T) {
 
 	if err := eng.Stop(context.Background()); err != nil {
 		t.Fatalf("failed to stop engine: %v", err)
+	}
+}
+
+type closeCountingDriver struct {
+	*broker.MockDriver
+	closeCalls atomic.Int32
+}
+
+func (d *closeCountingDriver) Close() error {
+	d.closeCalls.Add(1)
+	return d.MockDriver.Close()
+}
+
+// TestEngine_ShutdownRace is a regression test for bug 1.2: stopping the engine while
+// producers are actively pushing messages and delayed responses are in flight must never
+// panic (send on closed channel), deadlock, race, or close the broker driver more than once.
+func TestEngine_ShutdownRace(t *testing.T) {
+	cfg := &config.Config{
+		Broker: config.BrokerConfig{
+			URL: "amqp://localhost:5672/",
+		},
+		Rules: []config.Rule{
+			{
+				Name: "immediate-rule",
+				Trigger: config.Trigger{
+					Queue: "race.queue",
+				},
+				MockResponse: config.MockResponse{
+					Exchange:   "race.exchange",
+					RoutingKey: "race.out",
+					Payload: map[string]interface{}{
+						"id": "{{trigger.id}}",
+					},
+				},
+			},
+			{
+				Name: "delayed-rule",
+				Trigger: config.Trigger{
+					Queue: "race.queue",
+				},
+				MockResponse: config.MockResponse{
+					Exchange:   "race.exchange",
+					RoutingKey: "race.delayed",
+					DelayMS:    15,
+					Payload: map[string]interface{}{
+						"id": "{{trigger.id}}",
+					},
+				},
+			},
+		},
+	}
+
+	const iterations = 25
+	const producers = 4
+	discardLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	for i := 0; i < iterations; i++ {
+		drv := &closeCountingDriver{MockDriver: broker.NewMockDriver()}
+		spy := &testSpyRecorder{}
+		eng := NewEngine(cfg, drv, spy)
+		eng.logger = discardLogger
+		if err := eng.Start(); err != nil {
+			t.Fatalf("iteration %d: failed to start engine: %v", i, err)
+		}
+
+		var prodWG sync.WaitGroup
+		prodWG.Add(producers)
+		for p := 0; p < producers; p++ {
+			go func() {
+				defer prodWG.Done()
+				body := []byte(`{"id":"123"}`)
+				for {
+					if err := drv.SimulateIncomingMessage("race.queue", "race.in", body, nil); err != nil {
+						return
+					}
+				}
+			}()
+		}
+
+		// Let messages flow briefly before triggering concurrent Stop calls.
+		time.Sleep(2 * time.Millisecond)
+
+		var stopWG sync.WaitGroup
+		stopErrs := make([]error, 2)
+		for s := 0; s < 2; s++ {
+			stopWG.Add(1)
+			go func(idx int) {
+				defer stopWG.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				stopErrs[idx] = eng.Stop(ctx)
+			}(s)
+		}
+
+		stopWG.Wait()
+		prodWG.Wait()
+
+		for idx, err := range stopErrs {
+			if err != nil {
+				t.Fatalf("iteration %d: Stop[%d] returned error: %v", i, idx, err)
+			}
+		}
+		if got := drv.closeCalls.Load(); got != 1 {
+			t.Fatalf("iteration %d: expected driver.Close() to be called exactly once, got %d", i, got)
+		}
+	}
+}
+
+func TestValidateTemplates(t *testing.T) {
+	validCfg := &config.Config{
+		Rules: []config.Rule{
+			{
+				Name: "structured",
+				MockResponse: config.MockResponse{
+					Payload: map[string]interface{}{
+						"id":     "{{trigger.order.id}}",
+						"amount": "{{trigger.amount | json}}",
+						"nested": []interface{}{"{{uuid}}", "{{system.utc_now}}"},
+					},
+				},
+			},
+			{
+				Name: "raw-string",
+				MockResponse: config.MockResponse{
+					Payload: `{"id": {{json trigger.id}}}`,
+				},
+			},
+		},
+	}
+	if err := ValidateTemplates(validCfg); err != nil {
+		t.Fatalf("expected valid templates to pass, got: %v", err)
+	}
+
+	invalidCfg := &config.Config{
+		Rules: []config.Rule{
+			{
+				Name: "bad-leaf",
+				MockResponse: config.MockResponse{
+					Payload: map[string]interface{}{
+						"broken": "{{trigger.id",
+					},
+				},
+			},
+			{
+				Name: "bad-string",
+				MockResponse: config.MockResponse{
+					Payload: `{{unknownFunc trigger.id}}`,
+				},
+			},
+		},
+	}
+	err := ValidateTemplates(invalidCfg)
+	if err == nil {
+		t.Fatal("expected error for invalid templates, got nil")
+	}
+	if !strings.Contains(err.Error(), "bad-leaf") || !strings.Contains(err.Error(), "bad-string") {
+		t.Errorf("expected error to report both invalid rules, got: %v", err)
+	}
+}
+
+func TestMatchesRule_AdvancedOperatorsAndTypeAwareness(t *testing.T) {
+	boolTrue := true
+	boolFalse := false
+	gt10 := 10.0
+	lt100 := 100.0
+
+	body := []byte(`{
+		"order": {"status": "Pending", "amount": 42.5, "tags": ["vip", "express"], "code": "ORD-991"},
+		"flag": true
+	}`)
+	msg := broker.Message{
+		Queue:      "orders.q",
+		RoutingKey: "order.eu.created",
+		Headers: map[string]interface{}{
+			"x-tenant": []byte("acme-prod"),
+			"x-retry":  int64(2),
+		},
+		Body: body,
+	}
+
+	// Type-aware and case-sensitive checks:
+	// "Pending" != "pending" and true != "true"
+	if MatchesRule(&config.Rule{Trigger: config.Trigger{
+		JSONPathRules: []config.JSONPathRule{{Filter: "order.status", Equals: "pending"}},
+	}}, msg) {
+		t.Error("expected case-sensitive mismatch between 'Pending' and 'pending'")
+	}
+	if MatchesRule(&config.Rule{Trigger: config.Trigger{
+		JSONPathRules: []config.JSONPathRule{{Filter: "flag", Equals: "true"}},
+	}}, msg) {
+		t.Error("expected type-aware mismatch between bool true and string 'true'")
+	}
+
+	// Wildcard routing key + headers + all JSONPath operators
+	rule := &config.Rule{
+		Name: "advanced",
+		Trigger: config.Trigger{
+			Queue:      "orders.q",
+			RoutingKey: "order.*.created",
+			HeaderRules: []config.HeaderRule{
+				{Name: "x-tenant", Contains: "acme", Matches: `^acme-(prod|staging)$`},
+				{Name: "x-retry", In: []interface{}{1, 2, 3}},
+				{Name: "x-absent", Exists: &boolFalse},
+			},
+			JSONPathRules: []config.JSONPathRule{
+				{Filter: "order.status", Equals: "Pending", NotEquals: "Cancelled"},
+				{Filter: "order.amount", GT: &gt10, LT: &lt100},
+				{Filter: "order.tags", Contains: "vip"},
+				{Filter: "order.code", Matches: `^ORD-\d+$`},
+				{Filter: "flag", Exists: &boolTrue, Equals: true},
+				{Filter: "missing.field", Exists: &boolFalse},
+			},
+		},
+	}
+	if !MatchesRule(rule, msg) {
+		t.Fatal("expected advanced rule with wildcards, headers, and operators to match")
+	}
+}
+
+func TestRenderPayload_ExtraHelpersAndTrimMarkers(t *testing.T) {
+	t.Setenv("CHITCHAT_TEST_ENV", "ci-runner")
+
+	payloadDef := map[string]interface{}{
+		"corr_id": "{{header \"x-corr\"}}",
+		"env_val": "{{env \"CHITCHAT_TEST_ENV\"}}",
+		"seq":     "{{- counter -}}",
+		"trimmed": "{{- trigger.name -}}",
+	}
+	msg := broker.Message{
+		Headers: map[string]interface{}{"x-corr": []byte("corr-42")},
+		Body:    []byte(`{"name": "alice"}`),
+	}
+
+	out, err := RenderPayload(payloadDef, msg)
+	if err != nil {
+		t.Fatalf("RenderPayload failed: %v", err)
+	}
+	var res map[string]interface{}
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if res["corr_id"] != "corr-42" {
+		t.Errorf("expected corr_id 'corr-42', got %v", res["corr_id"])
+	}
+	if res["env_val"] != "ci-runner" {
+		t.Errorf("expected env_val 'ci-runner', got %v", res["env_val"])
+	}
+	if res["trimmed"] != "alice" {
+		t.Errorf("expected trimmed 'alice', got %v", res["trimmed"])
+	}
+	if res["seq"] == "" {
+		t.Errorf("expected non-empty counter value")
+	}
+}
+
+func TestEngine_PriorityStopOnMatchTimesMultiResponseAndFaults(t *testing.T) {
+	cfg := &config.Config{
+		Broker: config.BrokerConfig{URL: "amqp://localhost:5672/"},
+		Rules: []config.Rule{
+			{
+				Name:     "low-priority-fallback",
+				Priority: 1,
+				Trigger:  config.Trigger{Queue: "events.q"},
+				MockResponse: config.MockResponse{
+					Exchange:   "out.ex",
+					RoutingKey: "fallback",
+					Payload:    map[string]interface{}{"rule": "fallback"},
+				},
+			},
+			{
+				Name:        "high-priority-once",
+				Priority:    10,
+				StopOnMatch: true,
+				Times:       1,
+				Trigger:     config.Trigger{Queue: "events.q"},
+				MockResponses: []config.MockResponse{
+					{
+						Exchange:   "out.ex",
+						RoutingKey: "primary.{{trigger.id}}",
+						Headers:    map[string]interface{}{"x-echo": "{{header \"x-trace\"}}"},
+						Duplicate:  2,
+						Payload:    map[string]interface{}{"rule": "high"},
+					},
+					{
+						Drop: true, // fault injection: must not publish
+					},
+				},
+			},
+		},
+	}
+
+	drv := broker.NewMockDriver()
+	_ = drv.Connect(cfg.Broker.URL)
+	eng := NewEngine(cfg, drv, &testSpyRecorder{})
+	eng.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := eng.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer eng.Stop(context.Background())
+
+	// First message: hits high-priority-once (priority 10), duplicates 2x, drops 2nd response, stops before fallback
+	_ = drv.SimulateIncomingMessage("events.q", "ev", []byte(`{"id":"1"}`), map[string]interface{}{"x-trace": "t-1"})
+	// Second message: high-priority-once exhausted (times: 1), so falls through to low-priority-fallback
+	_ = drv.SimulateIncomingMessage("events.q", "ev", []byte(`{"id":"2"}`), nil)
+
+	// Wait deterministically for all 3 asynchronous publications and counter updates to complete.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if eng.MetricsSnapshot().MessagesPublished >= 3 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	pubs := drv.GetPublished()
+
+	if len(pubs) != 3 {
+		t.Fatalf("expected 3 published messages (2 duplicates from high + 1 from fallback), got %d: %+v", len(pubs), pubs)
+	}
+
+	// Responses are dispatched asynchronously per trigger, so assert counts order-independently.
+	var primaryCount, fallbackCount int
+	for _, p := range pubs {
+		switch p.RoutingKey {
+		case "primary.1":
+			if p.Headers["x-echo"] != "t-1" {
+				t.Errorf("expected x-echo header 't-1' on primary.1, got %+v", p.Headers)
+			}
+			primaryCount++
+		case "fallback":
+			fallbackCount++
+		default:
+			t.Errorf("unexpected published message: %+v", p)
+		}
+	}
+	if primaryCount != 2 || fallbackCount != 1 {
+		t.Errorf("expected 2 primary.1 and 1 fallback messages, got primary=%d fallback=%d (%+v)", primaryCount, fallbackCount, pubs)
+	}
+
+	health := eng.HealthSnapshot()
+	if !health.BrokerConnected || health.Rules != 2 || health.Metrics.MessagesReceived != 2 || health.Metrics.MessagesPublished != 3 || health.Metrics.RulesMatched != 2 {
+		t.Errorf("unexpected health snapshot: %+v", health)
 	}
 }

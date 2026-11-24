@@ -36,6 +36,10 @@ func TestSanitizeURL(t *testing.T) {
 func TestRabbitMQDriver_UnconnectedErrors(t *testing.T) {
 	drv := NewRabbitMQDriver()
 
+	if drv.IsConnected() {
+		t.Errorf("expected IsConnected() to be false before Connect")
+	}
+
 	if err := drv.DeclareTopology(&config.Declarations{}); err == nil {
 		t.Errorf("expected error declaring topology when unconnected, got nil")
 	}
@@ -51,6 +55,13 @@ func TestRabbitMQDriver_UnconnectedErrors(t *testing.T) {
 
 	if err := drv.Close(); err != nil {
 		t.Errorf("unexpected error on Close: %v", err)
+	}
+	// Close must be idempotent
+	if err := drv.Close(); err != nil {
+		t.Errorf("unexpected error on second Close: %v", err)
+	}
+	if err := drv.Connect("amqp://localhost:5672/"); err == nil {
+		t.Errorf("expected error connecting after Close, got nil")
 	}
 }
 

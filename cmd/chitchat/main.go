@@ -29,11 +29,13 @@ var (
 	GitCommit = ""
 	BuildTime = ""
 
-	configPath string
-	portFlag   int
-	amqpURL    string
-	logLevel   string
-	logFormat  string
+	configPath     string
+	portFlag       int
+	brokerURL      string
+	amqpURL        string
+	logLevel       string
+	logFormat      string
+	connectTimeout string
 )
 
 func init() {
@@ -62,16 +64,16 @@ func init() {
 func main() {
 	rootCmd := &cobra.Command{
 		Use:          "chitchat",
-		Short:        "Declarative RabbitMQ Mocking & Spying Engine for CI/CD pipelines",
+		Short:        "Declarative Message Broker Mocking & Spying Engine for CI/CD pipelines",
 		Version:      Version,
 		SilenceUsage: true,
 		Long: `chitchat is a lightweight, declarative message queue mocking and spying server
 designed for automated CI/CD pipelines and AI coding agents.
 
-Declaratively mock message queues, match on JSON payloads with JSONPath,
+Declaratively mock message brokers, match on JSON payloads and headers,
 dynamically generate template responses, and spy on captured traffic via REST.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runChitchat()
+			return runChitchat(cmd.Context())
 		},
 	}
 
@@ -81,7 +83,7 @@ dynamically generate template responses, and spy on captured traffic via REST.`,
 		Long: `Starts the chitchat engine, connects to the configured broker, declares
 exchanges/queues, listens for triggers, and exposes the HTTP spy server.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runChitchat()
+			return runChitchat(cmd.Context())
 		},
 	}
 
@@ -113,9 +115,12 @@ status if the configuration is invalid, so it can gate CI pipelines.`,
 	// Register flags
 	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "chitchat-rules.yaml", "Path to rules configuration YAML file")
 	rootCmd.PersistentFlags().IntVarP(&portFlag, "port", "p", 0, "Port for the HTTP Spy server (overrides config)")
-	rootCmd.PersistentFlags().StringVarP(&amqpURL, "amqp-url", "u", "", "AMQP broker connection URL (overrides config)")
+	rootCmd.PersistentFlags().StringVarP(&brokerURL, "broker-url", "u", "", "Message broker connection URL (overrides config; env CHITCHAT_BROKER_URL)")
+	rootCmd.PersistentFlags().StringVar(&amqpURL, "amqp-url", "", "Deprecated alias for --broker-url")
+	_ = rootCmd.PersistentFlags().MarkDeprecated("amqp-url", "use --broker-url (-u) instead")
 	rootCmd.PersistentFlags().StringVarP(&logLevel, "log-level", "l", "", "Logging level (debug, info, warn, error)")
 	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "", "Logging output format (text, json)")
+	rootCmd.PersistentFlags().StringVar(&connectTimeout, "connect-timeout", "", "Retry initial broker connection for up to this duration (e.g. 30s)")
 
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(validateCmd)
@@ -126,17 +131,31 @@ status if the configuration is invalid, so it can gate CI pipelines.`,
 	}
 }
 
-// loadConfig reads the configuration file and applies CLI overrides.
+// resolveBrokerURLFlag returns the effective CLI/env broker URL override.
+func resolveBrokerURLFlag() string {
+	if brokerURL != "" {
+		return brokerURL
+	}
+	if amqpURL != "" {
+		return amqpURL
+	}
+	return os.Getenv("CHITCHAT_BROKER_URL")
+}
+
+// loadConfig reads the configuration file and applies CLI/env overrides.
 func loadConfig(path string) (*config.Config, error) {
 	cfg, err := config.LoadConfig(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load configuration: %w", err)
 	}
 
-	cfg.ApplyOverrides(amqpURL, portFlag, logLevel)
-	if logFormat != "" {
-		cfg.Logging.Format = logFormat
-	}
+	cfg.ApplyOverrides(config.Overrides{
+		BrokerURL:      resolveBrokerURLFlag(),
+		Port:           portFlag,
+		LogLevel:       logLevel,
+		LogFormat:      logFormat,
+		ConnectTimeout: connectTimeout,
+	})
 	return cfg, nil
 }
 
@@ -179,6 +198,52 @@ func connectBroker(d broker.Driver, cfg *config.Config) error {
 	return d.Connect(cfg.Broker.URL)
 }
 
+// connectBrokerWithRetry dials the broker and, if timeout > 0, retries with exponential backoff
+// until the connection succeeds, timeout elapses, or ctx is cancelled.
+func connectBrokerWithRetry(ctx context.Context, d broker.Driver, cfg *config.Config, timeout time.Duration, l *slog.Logger) error {
+	err := connectBroker(d, cfg)
+	if err == nil || timeout <= 0 {
+		return err
+	}
+
+	deadline := time.Now().Add(timeout)
+	backoff := 200 * time.Millisecond
+	const maxBackoff = 2 * time.Second
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("broker did not become ready within %s: %w", timeout, err)
+		}
+		wait := backoff
+		if wait > remaining {
+			wait = remaining
+		}
+		if l != nil {
+			l.Warn("broker connection failed, retrying",
+				"url", broker.SanitizeURL(cfg.Broker.URL),
+				"retry_in", wait.Round(time.Millisecond).String(),
+				"error", err,
+			)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+
+		err = connectBroker(d, cfg)
+		if err == nil {
+			return nil
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
 // reloader is the part of the engine needed for hot reload.
 type reloader interface {
 	Reload(cfg *config.Config) error
@@ -214,7 +279,11 @@ func reloadConfig(eng reloader, current *config.Config, l *slog.Logger) (interfa
 	}, nil
 }
 
-func runChitchat() error {
+func runChitchat(parentCtx context.Context) error {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+
 	// 1. Load configuration
 	cfg, err := loadConfig(configPath)
 	if err != nil {
@@ -233,6 +302,11 @@ func runChitchat() error {
 		return err
 	}
 
+	var retryTimeout time.Duration
+	if cfg.Broker.ConnectTimeout != "" {
+		retryTimeout, _ = time.ParseDuration(cfg.Broker.ConnectTimeout)
+	}
+
 	l.Info("initializing chitchat engine",
 		"version", Version,
 		"config", configPath,
@@ -241,6 +315,9 @@ func runChitchat() error {
 		"log_level", cfg.Logging.Level,
 	)
 
+	sigCtx, stopSignals := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
 	// 4. Initialize Ring Buffer & Spy Server
 	ringBuffer := spy.NewRingBuffer(cfg.Server.RingBufferSize)
 	spyServer := spy.NewServer(cfg.Server.Port, ringBuffer).WithHost(cfg.Server.Host)
@@ -248,9 +325,9 @@ func runChitchat() error {
 		return fmt.Errorf("failed to start spy server: %w", err)
 	}
 
-	// 5. Initialize RabbitMQ Driver
+	// 5. Initialize RabbitMQ Driver (with optional startup retry)
 	driver := broker.NewRabbitMQDriver()
-	if err := connectBroker(driver, cfg); err != nil {
+	if err := connectBrokerWithRetry(sigCtx, driver, cfg, retryTimeout, l); err != nil {
 		_ = spyServer.Stop(context.Background())
 		return fmt.Errorf("failed to connect to rabbitmq: %w", err)
 	}
@@ -263,10 +340,22 @@ func runChitchat() error {
 		return fmt.Errorf("failed to start engine: %w", err)
 	}
 
-	// 7. Expose rule stats and hot reload through the spy API
+	// 7. Expose rule stats, health/metrics, and hot reload through the spy API
 	var reloadMu sync.Mutex
 	current := cfg
 	spyServer.SetRulesProvider(func() interface{} { return eng.RuleStats() })
+	spyServer.SetHealthProvider(func() spy.HealthSnapshot {
+		h := eng.HealthSnapshot()
+		return spy.HealthSnapshot{
+			BrokerConnected:   h.BrokerConnected,
+			SubscribedQueues:  h.SubscribedQueues,
+			Rules:             h.Rules,
+			MessagesReceived:  h.Metrics.MessagesReceived,
+			MessagesPublished: h.Metrics.MessagesPublished,
+			RulesMatched:      h.Metrics.RulesMatched,
+			Errors:            h.Metrics.Errors,
+		}
+	})
 	spyServer.SetReloader(func() (interface{}, error) {
 		reloadMu.Lock()
 		defer reloadMu.Unlock()
@@ -282,19 +371,11 @@ func runChitchat() error {
 
 	l.Info("chitchat is running and ready for mock traffic")
 
-	// 8. Handle OS signals for graceful termination
-	sigChan := make(chan os.Signal, 1)
-	forceExit := make(chan os.Signal, 1)
-	signal.Notify(forceExit, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-forceExit
-		<-forceExit
-		os.Exit(1)
-	}()
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	sig := <-sigChan
+	// 8. Wait for termination signal; restore default signal behavior so a second signal force-exits
+	<-sigCtx.Done()
+	stopSignals()
 
-	l.Info("received termination signal, shutting down", "signal", sig.String())
+	l.Info("received termination signal, shutting down")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

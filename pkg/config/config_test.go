@@ -110,7 +110,13 @@ func TestParseConfig_InvalidYAML(t *testing.T) {
 
 func TestApplyOverrides(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.ApplyOverrides("amqp://custom:5672/", 9090, "debug")
+	cfg.ApplyOverrides(Overrides{
+		BrokerURL:      "amqp://custom:5672/",
+		Port:           9090,
+		LogLevel:       "debug",
+		LogFormat:      "json",
+		ConnectTimeout: "15s",
+	})
 
 	if cfg.Broker.URL != "amqp://custom:5672/" {
 		t.Errorf("expected overridden broker url, got %s", cfg.Broker.URL)
@@ -121,10 +127,16 @@ func TestApplyOverrides(t *testing.T) {
 	if cfg.Logging.Level != "debug" {
 		t.Errorf("expected overridden log level debug, got %s", cfg.Logging.Level)
 	}
+	if cfg.Logging.Format != "json" {
+		t.Errorf("expected overridden log format json, got %s", cfg.Logging.Format)
+	}
+	if cfg.Broker.ConnectTimeout != "15s" {
+		t.Errorf("expected overridden connect_timeout 15s, got %s", cfg.Broker.ConnectTimeout)
+	}
 
-	// Verify partial overrides don't clear non-zero values
-	cfg.ApplyOverrides("", 0, "")
-	if cfg.Broker.URL != "amqp://custom:5672/" || cfg.Server.Port != 9090 || cfg.Logging.Level != "debug" {
+	// Verify empty overrides don't clear existing values
+	cfg.ApplyOverrides(Overrides{})
+	if cfg.Broker.URL != "amqp://custom:5672/" || cfg.Server.Port != 9090 || cfg.Logging.Level != "debug" || cfg.Logging.Format != "json" || cfg.Broker.ConnectTimeout != "15s" {
 		t.Errorf("empty overrides altered settings: %+v", cfg)
 	}
 }
@@ -273,5 +285,155 @@ rules:
 	_, err := ParseConfig([]byte(yamlWithTypos))
 	if err == nil {
 		t.Fatalf("expected error on unknown YAML field 'delay_msec', got nil")
+	}
+}
+
+func TestConfig_NeutralAliases(t *testing.T) {
+	neutralYAML := `
+broker:
+  url: "amqp://localhost:5672/"
+  connect_timeout: "10s"
+spy:
+  sources:
+    - "audit.events"
+  topics:
+    - "metrics.events"
+rules:
+  - name: "neutral-rule"
+    priority: 10
+    stop_on_match: true
+    times: 3
+    trigger:
+      source: "orders.in"
+      key: "order.*"
+      header_rules:
+        - name: "x-tenant"
+          equals: "acme"
+      jsonpath_rules:
+        - filter: "order.total"
+          gt: 10.5
+    mock_response:
+      destination: "orders.exchange"
+      key: "order.processed"
+      delay_ms_range: [10, 50]
+      duplicate: 2
+      payload:
+        ok: true
+`
+	cfg, err := ParseConfig([]byte(neutralYAML))
+	if err != nil {
+		t.Fatalf("ParseConfig failed for neutral aliases: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate failed for neutral aliases: %v", err)
+	}
+
+	if len(cfg.Spy.Queues) != 2 || cfg.Spy.Queues[0] != "audit.events" || cfg.Spy.Queues[1] != "metrics.events" {
+		t.Errorf("expected spy queues to merge sources & topics, got %v", cfg.Spy.Queues)
+	}
+	r := cfg.Rules[0]
+	if r.Trigger.Queue != "orders.in" || r.Trigger.RoutingKey != "order.*" {
+		t.Errorf("unexpected normalized trigger: %+v", r.Trigger)
+	}
+	if r.MockResponse.Exchange != "orders.exchange" || r.MockResponse.RoutingKey != "order.processed" {
+		t.Errorf("unexpected normalized mock_response: %+v", r.MockResponse)
+	}
+}
+
+func TestConfig_ConflictingAliases(t *testing.T) {
+	conflictYAML := `
+broker:
+  url: "amqp://localhost:5672/"
+rules:
+  - name: "conflict"
+    trigger:
+      queue: "q1"
+      source: "q2"
+    mock_response:
+      exchange: "ex1"
+      destination: "ex2"
+      routing_key: "rk1"
+`
+	_, err := ParseConfig([]byte(conflictYAML))
+	if err == nil {
+		t.Fatal("expected error for conflicting aliases, got nil")
+	}
+	if !strings.Contains(err.Error(), "conflicting aliases") {
+		t.Errorf("expected conflicting aliases error, got: %v", err)
+	}
+}
+
+func TestConfig_ValidateNewFields(t *testing.T) {
+	tests := []struct {
+		name      string
+		modify    func(c *Config)
+		wantError bool
+	}{
+		{
+			name: "invalid connect_timeout",
+			modify: func(c *Config) {
+				c.Broker.ConnectTimeout = "not-a-duration"
+			},
+			wantError: true,
+		},
+		{
+			name: "invalid delay_ms_range order",
+			modify: func(c *Config) {
+				c.Rules = []Rule{{
+					Name:         "r1",
+					Trigger:      Trigger{Queue: "q1"},
+					MockResponse: MockResponse{RoutingKey: "rk1", DelayMSRange: []int{100, 50}},
+				}}
+			},
+			wantError: true,
+		},
+		{
+			name: "invalid regex in jsonpath_rules.matches",
+			modify: func(c *Config) {
+				c.Rules = []Rule{{
+					Name: "r1",
+					Trigger: Trigger{
+						Queue:         "q1",
+						JSONPathRules: []JSONPathRule{{Filter: "a", Matches: "[unclosed"}},
+					},
+					MockResponse: MockResponse{RoutingKey: "rk1"},
+				}}
+			},
+			wantError: true,
+		},
+		{
+			name: "drop rule does not require exchange or routing_key",
+			modify: func(c *Config) {
+				c.Rules = []Rule{{
+					Name:         "drop-rule",
+					Trigger:      Trigger{Queue: "q1"},
+					MockResponse: MockResponse{Drop: true},
+				}}
+			},
+			wantError: false,
+		},
+		{
+			name: "both mock_response and mock_responses set",
+			modify: func(c *Config) {
+				c.Rules = []Rule{{
+					Name:          "both",
+					Trigger:       Trigger{Queue: "q1"},
+					MockResponse:  MockResponse{RoutingKey: "rk1"},
+					MockResponses: []MockResponse{{RoutingKey: "rk2"}},
+				}}
+			},
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			tt.modify(cfg)
+			err := cfg.Validate()
+			if (err != nil) != tt.wantError {
+				t.Errorf("Validate() error = %v, wantError %v", err, tt.wantError)
+			}
+		})
 	}
 }
