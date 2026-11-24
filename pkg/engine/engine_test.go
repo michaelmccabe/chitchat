@@ -3,8 +3,11 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -308,5 +311,162 @@ func TestEngine_EndToEnd(t *testing.T) {
 
 	if err := eng.Stop(context.Background()); err != nil {
 		t.Fatalf("failed to stop engine: %v", err)
+	}
+}
+
+type closeCountingDriver struct {
+	*broker.MockDriver
+	closeCalls atomic.Int32
+}
+
+func (d *closeCountingDriver) Close() error {
+	d.closeCalls.Add(1)
+	return d.MockDriver.Close()
+}
+
+// TestEngine_ShutdownRace is a regression test for bug 1.2: stopping the engine while
+// producers are actively pushing messages and delayed responses are in flight must never
+// panic (send on closed channel), deadlock, race, or close the broker driver more than once.
+func TestEngine_ShutdownRace(t *testing.T) {
+	cfg := &config.Config{
+		Broker: config.BrokerConfig{
+			URL: "amqp://localhost:5672/",
+		},
+		Rules: []config.Rule{
+			{
+				Name: "immediate-rule",
+				Trigger: config.Trigger{
+					Queue: "race.queue",
+				},
+				MockResponse: config.MockResponse{
+					Exchange:   "race.exchange",
+					RoutingKey: "race.out",
+					Payload: map[string]interface{}{
+						"id": "{{trigger.id}}",
+					},
+				},
+			},
+			{
+				Name: "delayed-rule",
+				Trigger: config.Trigger{
+					Queue: "race.queue",
+				},
+				MockResponse: config.MockResponse{
+					Exchange:   "race.exchange",
+					RoutingKey: "race.delayed",
+					DelayMS:    15,
+					Payload: map[string]interface{}{
+						"id": "{{trigger.id}}",
+					},
+				},
+			},
+		},
+	}
+
+	const iterations = 25
+	const producers = 4
+	discardLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	for i := 0; i < iterations; i++ {
+		drv := &closeCountingDriver{MockDriver: broker.NewMockDriver()}
+		spy := &testSpyRecorder{}
+		eng := NewEngine(cfg, drv, spy)
+		eng.logger = discardLogger
+		if err := eng.Start(); err != nil {
+			t.Fatalf("iteration %d: failed to start engine: %v", i, err)
+		}
+
+		var prodWG sync.WaitGroup
+		prodWG.Add(producers)
+		for p := 0; p < producers; p++ {
+			go func() {
+				defer prodWG.Done()
+				body := []byte(`{"id":"123"}`)
+				for {
+					if err := drv.SimulateIncomingMessage("race.queue", "race.in", body, nil); err != nil {
+						return
+					}
+				}
+			}()
+		}
+
+		// Let messages flow briefly before triggering concurrent Stop calls.
+		time.Sleep(2 * time.Millisecond)
+
+		var stopWG sync.WaitGroup
+		stopErrs := make([]error, 2)
+		for s := 0; s < 2; s++ {
+			stopWG.Add(1)
+			go func(idx int) {
+				defer stopWG.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				stopErrs[idx] = eng.Stop(ctx)
+			}(s)
+		}
+
+		stopWG.Wait()
+		prodWG.Wait()
+
+		for idx, err := range stopErrs {
+			if err != nil {
+				t.Fatalf("iteration %d: Stop[%d] returned error: %v", i, idx, err)
+			}
+		}
+		if got := drv.closeCalls.Load(); got != 1 {
+			t.Fatalf("iteration %d: expected driver.Close() to be called exactly once, got %d", i, got)
+		}
+	}
+}
+
+func TestValidateTemplates(t *testing.T) {
+	validCfg := &config.Config{
+		Rules: []config.Rule{
+			{
+				Name: "structured",
+				MockResponse: config.MockResponse{
+					Payload: map[string]interface{}{
+						"id":     "{{trigger.order.id}}",
+						"amount": "{{trigger.amount | json}}",
+						"nested": []interface{}{"{{uuid}}", "{{system.utc_now}}"},
+					},
+				},
+			},
+			{
+				Name: "raw-string",
+				MockResponse: config.MockResponse{
+					Payload: `{"id": {{json trigger.id}}}`,
+				},
+			},
+		},
+	}
+	if err := ValidateTemplates(validCfg); err != nil {
+		t.Fatalf("expected valid templates to pass, got: %v", err)
+	}
+
+	invalidCfg := &config.Config{
+		Rules: []config.Rule{
+			{
+				Name: "bad-leaf",
+				MockResponse: config.MockResponse{
+					Payload: map[string]interface{}{
+						"broken": "{{trigger.id",
+					},
+				},
+			},
+			{
+				Name: "bad-string",
+				MockResponse: config.MockResponse{
+					Payload: `{{unknownFunc trigger.id}}`,
+				},
+			},
+		},
+	}
+	err := ValidateTemplates(invalidCfg)
+	if err == nil {
+		t.Fatal("expected error for invalid templates, got nil")
+	}
+	if !strings.Contains(err.Error(), "bad-leaf") || !strings.Contains(err.Error(), "bad-string") {
+		t.Errorf("expected error to report both invalid rules, got: %v", err)
 	}
 }
