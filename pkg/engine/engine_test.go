@@ -616,20 +616,37 @@ func TestEngine_PriorityStopOnMatchTimesMultiResponseAndFaults(t *testing.T) {
 	// Second message: high-priority-once exhausted (times: 1), so falls through to low-priority-fallback
 	_ = drv.SimulateIncomingMessage("events.q", "ev", []byte(`{"id":"2"}`), nil)
 
-	time.Sleep(50 * time.Millisecond)
-
+	// Wait deterministically for all 3 asynchronous publications and counter updates to complete.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if eng.MetricsSnapshot().MessagesPublished >= 3 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	pubs := drv.GetPublished()
+
 	if len(pubs) != 3 {
 		t.Fatalf("expected 3 published messages (2 duplicates from high + 1 from fallback), got %d: %+v", len(pubs), pubs)
 	}
-	if pubs[0].RoutingKey != "primary.1" || pubs[0].Headers["x-echo"] != "t-1" {
-		t.Errorf("unexpected first published message: %+v", pubs[0])
+
+	// Responses are dispatched asynchronously per trigger, so assert counts order-independently.
+	var primaryCount, fallbackCount int
+	for _, p := range pubs {
+		switch p.RoutingKey {
+		case "primary.1":
+			if p.Headers["x-echo"] != "t-1" {
+				t.Errorf("expected x-echo header 't-1' on primary.1, got %+v", p.Headers)
+			}
+			primaryCount++
+		case "fallback":
+			fallbackCount++
+		default:
+			t.Errorf("unexpected published message: %+v", p)
+		}
 	}
-	if pubs[1].RoutingKey != "primary.1" {
-		t.Errorf("unexpected duplicate published message: %+v", pubs[1])
-	}
-	if pubs[2].RoutingKey != "fallback" {
-		t.Errorf("expected third message from fallback rule, got %+v", pubs[2])
+	if primaryCount != 2 || fallbackCount != 1 {
+		t.Errorf("expected 2 primary.1 and 1 fallback messages, got primary=%d fallback=%d (%+v)", primaryCount, fallbackCount, pubs)
 	}
 
 	health := eng.HealthSnapshot()
