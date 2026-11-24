@@ -2,10 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"chitchat/pkg/broker"
 	"chitchat/pkg/config"
@@ -15,22 +21,28 @@ func resetFlags(t *testing.T) {
 	t.Helper()
 	origConfigPath := configPath
 	origPortFlag := portFlag
+	origBrokerURL := brokerURL
 	origAMQPURL := amqpURL
 	origLogLevel := logLevel
 	origLogFormat := logFormat
+	origConnectTimeout := connectTimeout
 
 	configPath = ""
 	portFlag = 0
+	brokerURL = ""
 	amqpURL = ""
 	logLevel = ""
 	logFormat = ""
+	connectTimeout = ""
 
 	t.Cleanup(func() {
 		configPath = origConfigPath
 		portFlag = origPortFlag
+		brokerURL = origBrokerURL
 		amqpURL = origAMQPURL
 		logLevel = origLogLevel
 		logFormat = origLogFormat
+		connectTimeout = origConnectTimeout
 	})
 }
 
@@ -140,5 +152,65 @@ rules:
 	// Rule has no jsonpath_rules or routing_key so a warning should also be emitted to stderr.
 	if !strings.Contains(errOut.String(), "warning:") {
 		t.Errorf("expected warning on stderr, got: %q", errOut.String())
+	}
+}
+
+type flakyDriver struct {
+	*broker.MockDriver
+	failAttempts int32
+	attempts     atomic.Int32
+}
+
+func (f *flakyDriver) Connect(url string) error {
+	n := f.attempts.Add(1)
+	if n <= f.failAttempts {
+		return errors.New("connection refused")
+	}
+	return f.MockDriver.Connect(url)
+}
+
+func TestConnectBrokerWithRetry(t *testing.T) {
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := config.DefaultConfig()
+	cfg.Broker.URL = "amqp://user:pass@localhost:5672/"
+
+	// Succeeds on 3rd attempt within timeout
+	drv := &flakyDriver{MockDriver: broker.NewMockDriver(), failAttempts: 2}
+	if err := connectBrokerWithRetry(context.Background(), drv, cfg, 2*time.Second, discard); err != nil {
+		t.Fatalf("expected retry to succeed, got: %v", err)
+	}
+	if got := drv.attempts.Load(); got != 3 {
+		t.Errorf("expected 3 attempts, got %d", got)
+	}
+	if drv.URL != cfg.Broker.URL {
+		t.Errorf("expected unsanitized URL %q, got %q", cfg.Broker.URL, drv.URL)
+	}
+
+	// Fails immediately when timeout is 0
+	drvImmediate := &flakyDriver{MockDriver: broker.NewMockDriver(), failAttempts: 5}
+	if err := connectBrokerWithRetry(context.Background(), drvImmediate, cfg, 0, discard); err == nil {
+		t.Fatal("expected error when timeout is 0")
+	}
+	if got := drvImmediate.attempts.Load(); got != 1 {
+		t.Errorf("expected exactly 1 attempt with timeout=0, got %d", got)
+	}
+}
+
+func TestResolveBrokerURLFlag(t *testing.T) {
+	resetFlags(t)
+	t.Setenv("CHITCHAT_BROKER_URL", "amqp://env:secret@envhost:5672/")
+
+	if got := resolveBrokerURLFlag(); got != "amqp://env:secret@envhost:5672/" {
+		t.Errorf("expected env fallback, got %q", got)
+	}
+
+	amqpURL = "amqp://legacy@host:5672/"
+	if got := resolveBrokerURLFlag(); got != "amqp://legacy@host:5672/" {
+		t.Errorf("expected deprecated --amqp-url to override env, got %q", got)
+	}
+
+	brokerURL = "amqp://neutral@host:5672/"
+	if got := resolveBrokerURLFlag(); got != "amqp://neutral@host:5672/" {
+		t.Errorf("expected --broker-url to take precedence, got %q", got)
 	}
 }

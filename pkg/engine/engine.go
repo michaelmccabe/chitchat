@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	rand "math/rand/v2"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"chitchat/pkg/broker"
@@ -18,28 +21,67 @@ type SpyRecorder interface {
 	Record(msg broker.Message)
 }
 
+// ConnectionReporter is an optional interface that broker drivers can implement so
+// health/metrics endpoints can report live broker connectivity.
+type ConnectionReporter interface {
+	IsConnected() bool
+}
+
+// Metrics holds runtime observability counters for the engine.
+type Metrics struct {
+	MessagesReceived  int64 `json:"messages_received"`
+	MessagesPublished int64 `json:"messages_published"`
+	RulesMatched      int64 `json:"rules_matched"`
+	Errors            int64 `json:"errors"`
+}
+
+// HealthInfo summarizes engine and broker health for /_chitchat/health and /_chitchat/metrics.
+type HealthInfo struct {
+	BrokerConnected  bool     `json:"broker_connected"`
+	SubscribedQueues []string `json:"subscribed_queues"`
+	Rules            int      `json:"rules"`
+	Metrics          Metrics  `json:"metrics"`
+}
+
 // RuleStat is a read-only snapshot of a loaded rule and how often it has matched.
 type RuleStat struct {
 	Name               string `json:"name"`
 	Queue              string `json:"queue"`
 	RoutingKey         string `json:"routing_key,omitempty"`
+	Priority           int    `json:"priority,omitempty"`
+	StopOnMatch        bool   `json:"stop_on_match,omitempty"`
+	Times              int    `json:"times,omitempty"`
 	ResponseExchange   string `json:"response_exchange"`
 	ResponseRoutingKey string `json:"response_routing_key"`
 	DelayMS            int    `json:"delay_ms"`
 	Matches            int64  `json:"matches"`
 }
 
-// ruleState pairs a rule with its runtime match counter.
-type ruleState struct {
-	mu      sync.Mutex
-	rule    config.Rule
-	matches int64
+type compiledResponse struct {
+	spec           config.MockResponse
+	payload        *CompiledPayload
+	routingKeyTmpl *compiledLeaf
+	headerTmpls    map[string]*compiledLeaf
 }
 
-func (rs *ruleState) incMatches() {
+// ruleState pairs a rule with its pre-compiled responses and runtime match counter.
+type ruleState struct {
+	mu        sync.Mutex
+	rule      config.Rule
+	responses []compiledResponse
+	matches   int64
+}
+
+// tryClaimMatch increments the match counter and returns true unless the rule has
+// exhausted its configured Times limit.
+func (rs *ruleState) tryClaimMatch() bool {
 	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.rule.Times > 0 && rs.matches >= int64(rs.rule.Times) {
+		return false
+	}
 	rs.matches++
-	rs.mu.Unlock()
+	return true
 }
 
 func (rs *ruleState) getMatches() int64 {
@@ -48,12 +90,54 @@ func (rs *ruleState) getMatches() int64 {
 	return rs.matches
 }
 
-func newRuleStates(rules []config.Rule) []*ruleState {
-	states := make([]*ruleState, len(rules))
-	for i, r := range rules {
-		states[i] = &ruleState{rule: r}
+func compileRuleStates(rules []config.Rule, counter *atomic.Int64) ([]*ruleState, error) {
+	// Sort by priority descending while preserving YAML order on ties.
+	ordered := make([]config.Rule, len(rules))
+	copy(ordered, rules)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].Priority > ordered[j].Priority
+	})
+
+	states := make([]*ruleState, 0, len(ordered))
+	for _, r := range ordered {
+		resps := r.Responses()
+		compiled := make([]compiledResponse, 0, len(resps))
+		for _, spec := range resps {
+			cp, err := CompilePayload(spec.Payload, counter)
+			if err != nil {
+				return nil, fmt.Errorf("rule %q: %w", r.Name, err)
+			}
+			cr := compiledResponse{
+				spec:    spec,
+				payload: cp,
+			}
+			if strings.Contains(spec.RoutingKey, "{{") {
+				leaf, err := compileLeaf(spec.RoutingKey, true, counter)
+				if err != nil {
+					return nil, fmt.Errorf("rule %q routing_key: %w", r.Name, err)
+				}
+				cr.routingKeyTmpl = leaf
+			}
+			for hk, hv := range spec.Headers {
+				if s, ok := hv.(string); ok && strings.Contains(s, "{{") {
+					leaf, err := compileLeaf(s, true, counter)
+					if err != nil {
+						return nil, fmt.Errorf("rule %q header %q: %w", r.Name, hk, err)
+					}
+					if cr.headerTmpls == nil {
+						cr.headerTmpls = make(map[string]*compiledLeaf)
+					}
+					cr.headerTmpls[hk] = leaf
+				}
+			}
+			compiled = append(compiled, cr)
+		}
+		states = append(states, &ruleState{
+			rule:      r,
+			responses: compiled,
+		})
 	}
-	return states
+	return states, nil
 }
 
 // Engine coordinates message consumption, rule evaluation, and mock response dispatching.
@@ -74,12 +158,18 @@ type Engine struct {
 
 	rulesMu sync.RWMutex // guards rules
 	rules   []*ruleState
+
+	tmplCounter       atomic.Int64
+	messagesReceived  atomic.Int64
+	messagesPublished atomic.Int64
+	rulesMatched      atomic.Int64
+	errorsTotal       atomic.Int64
 }
 
 // NewEngine constructs a new mock engine instance.
 func NewEngine(cfg *config.Config, driver broker.Driver, spyRecorder SpyRecorder) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Engine{
+	e := &Engine{
 		cfg:         cfg,
 		driver:      driver,
 		spyRecorder: spyRecorder,
@@ -88,8 +178,12 @@ func NewEngine(cfg *config.Config, driver broker.Driver, spyRecorder SpyRecorder
 		ctx:         ctx,
 		cancel:      cancel,
 		subscribed:  make(map[string]struct{}),
-		rules:       newRuleStates(cfg.Rules),
 	}
+	// Best-effort compile here so RuleStats works even before Start; Start returns any compile error.
+	if states, err := compileRuleStates(cfg.Rules, &e.tmplCounter); err == nil {
+		e.rules = states
+	}
+	return e
 }
 
 // desiredQueues returns the sorted set of queues to consume: rule trigger queues plus spy-only queues.
@@ -113,7 +207,8 @@ func desiredQueues(cfg *config.Config) []string {
 	return queues
 }
 
-// Start declares broker topology, attaches consumers to trigger queues, and starts message processing.
+// Start compiles rule templates, declares broker topology, attaches consumers to trigger queues,
+// and starts message processing.
 func (e *Engine) Start() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -125,12 +220,25 @@ func (e *Engine) Start() error {
 		return nil
 	}
 
-	// 1. Declare Topology if configured
+	if err := e.cfg.Normalize(); err != nil {
+		return fmt.Errorf("failed to normalize config: %w", err)
+	}
+
+	// 1. Pre-compile all rule payload/routing_key/header templates
+	states, err := compileRuleStates(e.cfg.Rules, &e.tmplCounter)
+	if err != nil {
+		return fmt.Errorf("failed to compile rule templates: %w", err)
+	}
+	e.rulesMu.Lock()
+	e.rules = states
+	e.rulesMu.Unlock()
+
+	// 2. Declare Topology if configured
 	if err := e.driver.DeclareTopology(&e.cfg.Broker.Declarations); err != nil {
 		return fmt.Errorf("failed to declare broker topology: %w", err)
 	}
 
-	// 2. Subscribe to trigger queues and spy-only queues
+	// 3. Subscribe to trigger queues and spy-only queues
 	queues := desiredQueues(e.cfg)
 	for _, q := range queues {
 		if err := e.driver.StartConsuming(q, e.msgChan); err != nil {
@@ -139,7 +247,7 @@ func (e *Engine) Start() error {
 		e.subscribed[q] = struct{}{}
 	}
 
-	// 3. Start Dispatcher Worker
+	// 4. Start Dispatcher Worker
 	e.running = true
 	e.wg.Add(1)
 	go e.processLoop()
@@ -164,6 +272,15 @@ func (e *Engine) Reload(cfg *config.Config) error {
 		return errors.New("engine is not running")
 	}
 
+	if err := cfg.Normalize(); err != nil {
+		return fmt.Errorf("failed to normalize config: %w", err)
+	}
+
+	states, err := compileRuleStates(cfg.Rules, &e.tmplCounter)
+	if err != nil {
+		return fmt.Errorf("failed to compile rule templates: %w", err)
+	}
+
 	if err := e.driver.DeclareTopology(&cfg.Broker.Declarations); err != nil {
 		return fmt.Errorf("failed to declare broker topology: %w", err)
 	}
@@ -178,7 +295,7 @@ func (e *Engine) Reload(cfg *config.Config) error {
 	}
 
 	e.rulesMu.Lock()
-	e.rules = newRuleStates(cfg.Rules)
+	e.rules = states
 	e.rulesMu.Unlock()
 	e.cfg = cfg
 
@@ -191,17 +308,55 @@ func (e *Engine) RuleStats() []RuleStat {
 	rules := e.snapshotRules()
 	stats := make([]RuleStat, len(rules))
 	for i, rs := range rules {
+		firstResp := rs.rule.Responses()[0]
 		stats[i] = RuleStat{
 			Name:               rs.rule.Name,
 			Queue:              rs.rule.Trigger.Queue,
 			RoutingKey:         rs.rule.Trigger.RoutingKey,
-			ResponseExchange:   rs.rule.MockResponse.Exchange,
-			ResponseRoutingKey: rs.rule.MockResponse.RoutingKey,
-			DelayMS:            rs.rule.MockResponse.DelayMS,
+			Priority:           rs.rule.Priority,
+			StopOnMatch:        rs.rule.StopOnMatch,
+			Times:              rs.rule.Times,
+			ResponseExchange:   firstResp.Exchange,
+			ResponseRoutingKey: firstResp.RoutingKey,
+			DelayMS:            firstResp.DelayMS,
 			Matches:            rs.getMatches(),
 		}
 	}
 	return stats
+}
+
+// MetricsSnapshot returns current engine counters.
+func (e *Engine) MetricsSnapshot() Metrics {
+	return Metrics{
+		MessagesReceived:  e.messagesReceived.Load(),
+		MessagesPublished: e.messagesPublished.Load(),
+		RulesMatched:      e.rulesMatched.Load(),
+		Errors:            e.errorsTotal.Load(),
+	}
+}
+
+// HealthSnapshot reports broker connectivity, subscribed queues, rule count, and counters.
+func (e *Engine) HealthSnapshot() HealthInfo {
+	e.mu.Lock()
+	queues := make([]string, 0, len(e.subscribed))
+	for q := range e.subscribed {
+		queues = append(queues, q)
+	}
+	running := e.running && !e.stopped
+	e.mu.Unlock()
+	sort.Strings(queues)
+
+	connected := running
+	if cr, ok := e.driver.(ConnectionReporter); ok {
+		connected = cr.IsConnected()
+	}
+
+	return HealthInfo{
+		BrokerConnected:  connected,
+		SubscribedQueues: queues,
+		Rules:            len(e.snapshotRules()),
+		Metrics:          e.MetricsSnapshot(),
+	}
 }
 
 func (e *Engine) snapshotRules() []*ruleState {
@@ -227,6 +382,7 @@ func (e *Engine) handleMessage(msg broker.Message) {
 	if msg.Direction == "" {
 		msg.Direction = broker.DirectionReceived
 	}
+	e.messagesReceived.Add(1)
 
 	// Record in Spy Buffer
 	if e.spyRecorder != nil {
@@ -248,67 +404,137 @@ func (e *Engine) handleMessage(msg broker.Message) {
 		if !MatchesRule(&rs.rule, msg) {
 			continue
 		}
+		if !rs.tryClaimMatch() {
+			e.logger.Debug("rule match skipped because times limit reached",
+				"rule", rs.rule.Name,
+				"times", rs.rule.Times,
+			)
+			continue
+		}
+
 		matched = true
-		rs.incMatches()
+		e.rulesMatched.Add(1)
 		rule := rs.rule
 
 		e.logger.Info("matched rule",
 			"rule", rule.Name,
 			"queue", msg.Queue,
 			"routing_key", msg.RoutingKey,
-			"delay_ms", rule.MockResponse.DelayMS,
+			"responses", len(rs.responses),
 		)
 
-		renderedPayload, err := RenderPayload(rule.MockResponse.Payload, msg)
-		if err != nil {
-			e.logger.Error("failed to render payload template", "rule", rule.Name, "error", err)
-			continue
+		data := buildTemplateContext(msg)
+		for _, cr := range rs.responses {
+			if cr.spec.Drop {
+				e.logger.Info("dropping mock response (fault injection)", "rule", rule.Name)
+				continue
+			}
+
+			renderedPayload, err := cr.payload.Render(msg)
+			if err != nil {
+				e.errorsTotal.Add(1)
+				e.logger.Error("failed to render payload template", "rule", rule.Name, "error", err)
+				continue
+			}
+
+			routingKey := cr.spec.RoutingKey
+			if cr.routingKeyTmpl != nil {
+				rk, err := cr.routingKeyTmpl.execute(data, msg.Headers, &e.tmplCounter)
+				if err != nil {
+					e.errorsTotal.Add(1)
+					e.logger.Error("failed to render routing_key template", "rule", rule.Name, "error", err)
+					continue
+				}
+				routingKey = rk
+			}
+
+			headers := make(map[string]interface{}, len(cr.spec.Headers)+1)
+			headerErr := false
+			for hk, hv := range cr.spec.Headers {
+				if leaf, ok := cr.headerTmpls[hk]; ok {
+					renderedVal, err := leaf.execute(data, msg.Headers, &e.tmplCounter)
+					if err != nil {
+						e.errorsTotal.Add(1)
+						e.logger.Error("failed to render header template", "rule", rule.Name, "header", hk, "error", err)
+						headerErr = true
+						break
+					}
+					headers[hk] = renderedVal
+				} else {
+					headers[hk] = hv
+				}
+			}
+			if headerErr {
+				continue
+			}
+			headers[config.OriginHeader] = rule.Name
+
+			delay := computeDelay(cr.spec)
+			copies := cr.spec.Duplicate
+			if copies <= 0 {
+				copies = 1
+			}
+
+			// Asynchronously dispatch mock response with optional delay
+			e.wg.Add(1)
+			go func(ruleName, exchange, rk string, payload []byte, hdrs map[string]interface{}, d time.Duration, count int) {
+				defer e.wg.Done()
+				e.dispatch(ruleName, exchange, rk, payload, hdrs, d, count)
+			}(rule.Name, cr.spec.Exchange, routingKey, renderedPayload, headers, delay, copies)
 		}
 
-		// Asynchronously dispatch mock response with optional delay
-		e.wg.Add(1)
-		go func(r config.Rule, payload []byte) {
-			defer e.wg.Done()
-			e.dispatch(r, payload)
-		}(rule, renderedPayload)
+		if rule.StopOnMatch {
+			break
+		}
 	}
 
 	if !matched {
-		e.logger.Debug("no rule matched message", "queue", msg.Queue, "routing_key", msg.RoutingKey)
+		e.logger.Warn("no rule matched message", "queue", msg.Queue, "routing_key", msg.RoutingKey)
 	}
 }
 
+func computeDelay(spec config.MockResponse) time.Duration {
+	if len(spec.DelayMSRange) == 2 {
+		minMS, maxMS := spec.DelayMSRange[0], spec.DelayMSRange[1]
+		if maxMS > minMS {
+			return time.Duration(minMS+rand.N(maxMS-minMS+1)) * time.Millisecond
+		}
+		return time.Duration(minMS) * time.Millisecond
+	}
+	if spec.DelayMS > 0 {
+		return time.Duration(spec.DelayMS) * time.Millisecond
+	}
+	return 0
+}
+
 // dispatch publishes a rendered mock response (after the optional delay) and records it in the spy.
-func (e *Engine) dispatch(r config.Rule, payload []byte) {
-	if r.MockResponse.DelayMS > 0 {
+func (e *Engine) dispatch(ruleName, exchange, routingKey string, payload []byte, headers map[string]interface{}, delay time.Duration, copies int) {
+	if delay > 0 {
 		select {
-		case <-time.After(time.Duration(r.MockResponse.DelayMS) * time.Millisecond):
+		case <-time.After(delay):
 		case <-e.ctx.Done():
 			return
 		}
 	}
 
-	// Copy configured headers (never mutate the shared config map) and stamp the loop-guard header.
-	headers := make(map[string]interface{}, len(r.MockResponse.Headers)+1)
-	for k, v := range r.MockResponse.Headers {
-		headers[k] = v
-	}
-	headers[config.OriginHeader] = r.Name
+	for i := 0; i < copies; i++ {
+		if err := e.driver.Publish(exchange, routingKey, payload, headers); err != nil {
+			e.errorsTotal.Add(1)
+			e.logger.Error("failed to publish mock response", "rule", ruleName, "error", err)
+			return
+		}
+		e.messagesPublished.Add(1)
 
-	if err := e.driver.Publish(r.MockResponse.Exchange, r.MockResponse.RoutingKey, payload, headers); err != nil {
-		e.logger.Error("failed to publish mock response", "rule", r.Name, "error", err)
-		return
-	}
-
-	if e.spyRecorder != nil {
-		e.spyRecorder.Record(broker.Message{
-			Direction:  broker.DirectionPublished,
-			Exchange:   r.MockResponse.Exchange,
-			RoutingKey: r.MockResponse.RoutingKey,
-			Rule:       r.Name,
-			Headers:    headers,
-			Body:       payload,
-		})
+		if e.spyRecorder != nil {
+			e.spyRecorder.Record(broker.Message{
+				Direction:  broker.DirectionPublished,
+				Exchange:   exchange,
+				RoutingKey: routingKey,
+				Rule:       ruleName,
+				Headers:    headers,
+				Body:       payload,
+			})
+		}
 	}
 }
 

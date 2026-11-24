@@ -470,3 +470,170 @@ func TestValidateTemplates(t *testing.T) {
 		t.Errorf("expected error to report both invalid rules, got: %v", err)
 	}
 }
+
+func TestMatchesRule_AdvancedOperatorsAndTypeAwareness(t *testing.T) {
+	boolTrue := true
+	boolFalse := false
+	gt10 := 10.0
+	lt100 := 100.0
+
+	body := []byte(`{
+		"order": {"status": "Pending", "amount": 42.5, "tags": ["vip", "express"], "code": "ORD-991"},
+		"flag": true
+	}`)
+	msg := broker.Message{
+		Queue:      "orders.q",
+		RoutingKey: "order.eu.created",
+		Headers: map[string]interface{}{
+			"x-tenant": []byte("acme-prod"),
+			"x-retry":  int64(2),
+		},
+		Body: body,
+	}
+
+	// Type-aware and case-sensitive checks:
+	// "Pending" != "pending" and true != "true"
+	if MatchesRule(&config.Rule{Trigger: config.Trigger{
+		JSONPathRules: []config.JSONPathRule{{Filter: "order.status", Equals: "pending"}},
+	}}, msg) {
+		t.Error("expected case-sensitive mismatch between 'Pending' and 'pending'")
+	}
+	if MatchesRule(&config.Rule{Trigger: config.Trigger{
+		JSONPathRules: []config.JSONPathRule{{Filter: "flag", Equals: "true"}},
+	}}, msg) {
+		t.Error("expected type-aware mismatch between bool true and string 'true'")
+	}
+
+	// Wildcard routing key + headers + all JSONPath operators
+	rule := &config.Rule{
+		Name: "advanced",
+		Trigger: config.Trigger{
+			Queue:      "orders.q",
+			RoutingKey: "order.*.created",
+			HeaderRules: []config.HeaderRule{
+				{Name: "x-tenant", Contains: "acme", Matches: `^acme-(prod|staging)$`},
+				{Name: "x-retry", In: []interface{}{1, 2, 3}},
+				{Name: "x-absent", Exists: &boolFalse},
+			},
+			JSONPathRules: []config.JSONPathRule{
+				{Filter: "order.status", Equals: "Pending", NotEquals: "Cancelled"},
+				{Filter: "order.amount", GT: &gt10, LT: &lt100},
+				{Filter: "order.tags", Contains: "vip"},
+				{Filter: "order.code", Matches: `^ORD-\d+$`},
+				{Filter: "flag", Exists: &boolTrue, Equals: true},
+				{Filter: "missing.field", Exists: &boolFalse},
+			},
+		},
+	}
+	if !MatchesRule(rule, msg) {
+		t.Fatal("expected advanced rule with wildcards, headers, and operators to match")
+	}
+}
+
+func TestRenderPayload_ExtraHelpersAndTrimMarkers(t *testing.T) {
+	t.Setenv("CHITCHAT_TEST_ENV", "ci-runner")
+
+	payloadDef := map[string]interface{}{
+		"corr_id": "{{header \"x-corr\"}}",
+		"env_val": "{{env \"CHITCHAT_TEST_ENV\"}}",
+		"seq":     "{{- counter -}}",
+		"trimmed": "{{- trigger.name -}}",
+	}
+	msg := broker.Message{
+		Headers: map[string]interface{}{"x-corr": []byte("corr-42")},
+		Body:    []byte(`{"name": "alice"}`),
+	}
+
+	out, err := RenderPayload(payloadDef, msg)
+	if err != nil {
+		t.Fatalf("RenderPayload failed: %v", err)
+	}
+	var res map[string]interface{}
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if res["corr_id"] != "corr-42" {
+		t.Errorf("expected corr_id 'corr-42', got %v", res["corr_id"])
+	}
+	if res["env_val"] != "ci-runner" {
+		t.Errorf("expected env_val 'ci-runner', got %v", res["env_val"])
+	}
+	if res["trimmed"] != "alice" {
+		t.Errorf("expected trimmed 'alice', got %v", res["trimmed"])
+	}
+	if res["seq"] == "" {
+		t.Errorf("expected non-empty counter value")
+	}
+}
+
+func TestEngine_PriorityStopOnMatchTimesMultiResponseAndFaults(t *testing.T) {
+	cfg := &config.Config{
+		Broker: config.BrokerConfig{URL: "amqp://localhost:5672/"},
+		Rules: []config.Rule{
+			{
+				Name:     "low-priority-fallback",
+				Priority: 1,
+				Trigger:  config.Trigger{Queue: "events.q"},
+				MockResponse: config.MockResponse{
+					Exchange:   "out.ex",
+					RoutingKey: "fallback",
+					Payload:    map[string]interface{}{"rule": "fallback"},
+				},
+			},
+			{
+				Name:        "high-priority-once",
+				Priority:    10,
+				StopOnMatch: true,
+				Times:       1,
+				Trigger:     config.Trigger{Queue: "events.q"},
+				MockResponses: []config.MockResponse{
+					{
+						Exchange:   "out.ex",
+						RoutingKey: "primary.{{trigger.id}}",
+						Headers:    map[string]interface{}{"x-echo": "{{header \"x-trace\"}}"},
+						Duplicate:  2,
+						Payload:    map[string]interface{}{"rule": "high"},
+					},
+					{
+						Drop: true, // fault injection: must not publish
+					},
+				},
+			},
+		},
+	}
+
+	drv := broker.NewMockDriver()
+	_ = drv.Connect(cfg.Broker.URL)
+	eng := NewEngine(cfg, drv, &testSpyRecorder{})
+	eng.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := eng.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer eng.Stop(context.Background())
+
+	// First message: hits high-priority-once (priority 10), duplicates 2x, drops 2nd response, stops before fallback
+	_ = drv.SimulateIncomingMessage("events.q", "ev", []byte(`{"id":"1"}`), map[string]interface{}{"x-trace": "t-1"})
+	// Second message: high-priority-once exhausted (times: 1), so falls through to low-priority-fallback
+	_ = drv.SimulateIncomingMessage("events.q", "ev", []byte(`{"id":"2"}`), nil)
+
+	time.Sleep(50 * time.Millisecond)
+
+	pubs := drv.GetPublished()
+	if len(pubs) != 3 {
+		t.Fatalf("expected 3 published messages (2 duplicates from high + 1 from fallback), got %d: %+v", len(pubs), pubs)
+	}
+	if pubs[0].RoutingKey != "primary.1" || pubs[0].Headers["x-echo"] != "t-1" {
+		t.Errorf("unexpected first published message: %+v", pubs[0])
+	}
+	if pubs[1].RoutingKey != "primary.1" {
+		t.Errorf("unexpected duplicate published message: %+v", pubs[1])
+	}
+	if pubs[2].RoutingKey != "fallback" {
+		t.Errorf("expected third message from fallback rule, got %+v", pubs[2])
+	}
+
+	health := eng.HealthSnapshot()
+	if !health.BrokerConnected || health.Rules != 2 || health.Metrics.MessagesReceived != 2 || health.Metrics.MessagesPublished != 3 || health.Metrics.RulesMatched != 2 {
+		t.Errorf("unexpected health snapshot: %+v", health)
+	}
+}

@@ -27,12 +27,12 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version-file: go.mod
           cache: true
 
       - name: Run Tests Prior to Release
         run: |
-          go test -v -race ./pkg/...
+          go test -v -race ./pkg/... ./cmd/...
           go test -v -timeout 10m ./integration_tests/...
 
       - name: Resolve Release Version
